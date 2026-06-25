@@ -20,6 +20,7 @@ This MCP server wraps the NGS360 bioinformatics platform API, providing tools fo
 | **Settings** | 3 tools | Application settings management |
 | **Platforms** | 3 tools | Workflow execution platform registry |
 | **Manifest** | 2 tools | Manifest retrieval and validation |
+| **WES** | 8 tools | GA4GH Workflow Execution Service (run/monitor workflows) |
 
 ## Installation
 
@@ -42,7 +43,9 @@ The server uses environment variables for configuration:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NGS360_API_URL` | `http://localhost:8000` | Base URL of the NGS360 API |
-| `NGS360_API_TOKEN` | *(empty)* | Bearer token for authentication |
+| `NGS360_API_TOKEN` | *(empty)* | Bearer token for NGS360 authentication |
+| `WES_API_URL` | `http://localhost:8080` | Base URL of the GA4GH WES API service |
+| `WES_API_TOKEN` | *(empty)* | Bearer token for WES authentication |
 
 ## Usage
 
@@ -63,7 +66,9 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
       "command": "ngs360-mcp-server",
       "env": {
         "NGS360_API_URL": "https://your-ngs360-api.example.com",
-        "NGS360_API_TOKEN": "your-bearer-token"
+        "NGS360_API_TOKEN": "your-bearer-token",
+        "WES_API_URL": "https://your-wes-api.example.com",
+        "WES_API_TOKEN": "your-wes-bearer-token"
       }
     }
   }
@@ -81,7 +86,9 @@ Add to your MCP settings:
       "command": "ngs360-mcp-server",
       "env": {
         "NGS360_API_URL": "https://your-ngs360-api.example.com",
-        "NGS360_API_TOKEN": "your-bearer-token"
+        "NGS360_API_TOKEN": "your-bearer-token",
+        "WES_API_URL": "https://your-wes-api.example.com",
+        "WES_API_TOKEN": "your-wes-bearer-token"
       }
     }
   }
@@ -99,6 +106,7 @@ mcp-server/
 └── ngs360_mcp_server/
     ├── __init__.py
     ├── client.py          # HTTP client wrapper for the NGS360 API
+    ├── wes_client.py      # HTTP client wrapper for the GA4GH WES API
     ├── server.py          # MCP server entry point
     └── tools/
         ├── __init__.py
@@ -113,7 +121,8 @@ mcp-server/
         ├── vendors.py     # Vendor management tools
         ├── settings.py    # Settings tools
         ├── platforms.py   # Platform registry tools
-        └── manifest.py    # Manifest tools
+        ├── manifest.py    # Manifest tools
+        └── wes.py         # GA4GH Workflow Execution Service tools
 ```
 
 ### Testing with MCP Inspector
@@ -175,3 +184,14 @@ This MCP server covers the full NGS360 API surface at `/api/v1/*`:
 - `GET/PUT /settings` — Application settings
 - `POST/GET /platforms` — Platform registry
 - `GET/POST /manifest` — Manifest operations
+
+### GA4GH WES API (`/ga4gh/wes/v1/*`, separate host)
+
+- `GET /service-info` — WES service capabilities
+- `GET /runs` — List workflow runs
+- `POST /runs` — Submit a workflow run
+- `GET /runs/{run_id}` — Full run log
+- `GET /runs/{run_id}/status` — Run state
+- `POST /runs/{run_id}/cancel` — Cancel a run
+- `GET /runs/{run_id}/tasks` — List tasks for a run
+- `GET /runs/{run_id}/tasks/{task_id}` — Get task details
