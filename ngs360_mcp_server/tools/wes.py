@@ -4,10 +4,10 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from ngs360_mcp_server.wes_client import WESClient
+from ngs360_mcp_server.client import NGS360Client
 
 
-def register_wes_tools(mcp: FastMCP, wes_client: WESClient) -> None:
+def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
     """Register all GA4GH WES-related tools with the MCP server."""
 
     @mcp.tool()
