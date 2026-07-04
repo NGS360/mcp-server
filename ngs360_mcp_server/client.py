@@ -13,16 +13,21 @@ class NGS360Client:
         self,
         base_url: str | None = None,
         token: str | None = None,
+        path_prefix: str = "/api/v1",
     ):
         self.base_url = (
             base_url or os.environ.get("NGS360_API_URL", "http://localhost:8000")
         ).rstrip("/")
         self.token = token or os.environ.get("NGS360_API_TOKEN", "")
+        self.path_prefix = path_prefix
         self._client: httpx.AsyncClient | None = None
 
     @property
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
@@ -44,7 +49,7 @@ class NGS360Client:
         self, path: str, params: dict[str, Any] | None = None
     ) -> dict | list | str:
         client = await self._get_client()
-        resp = await client.get(f"/api/v1{path}", params=params)
+        resp = await client.get(f"{self.path_prefix}{path}", params=params)
         resp.raise_for_status()
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
@@ -54,10 +59,13 @@ class NGS360Client:
         self,
         path: str,
         json: dict[str, Any] | list | None = None,
+        data: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict | list | str:
         client = await self._get_client()
-        resp = await client.post(f"/api/v1{path}", json=json, params=params)
+        resp = await client.post(
+            f"{self.path_prefix}{path}", json=json, data=data, params=params
+        )
         resp.raise_for_status()
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
@@ -70,7 +78,7 @@ class NGS360Client:
         params: dict[str, Any] | None = None,
     ) -> dict | list | str:
         client = await self._get_client()
-        resp = await client.put(f"/api/v1{path}", json=json, params=params)
+        resp = await client.put(f"{self.path_prefix}{path}", json=json, params=params)
         resp.raise_for_status()
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
@@ -82,7 +90,7 @@ class NGS360Client:
         json: dict[str, Any] | None = None,
     ) -> dict | list | str:
         client = await self._get_client()
-        resp = await client.patch(f"/api/v1{path}", json=json)
+        resp = await client.patch(f"{self.path_prefix}{path}", json=json)
         resp.raise_for_status()
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
@@ -92,7 +100,7 @@ class NGS360Client:
         self, path: str, params: dict[str, Any] | None = None
     ) -> dict | str | None:
         client = await self._get_client()
-        resp = await client.delete(f"/api/v1{path}", params=params)
+        resp = await client.delete(f"{self.path_prefix}{path}", params=params)
         resp.raise_for_status()
         if resp.status_code == 204:
             return None

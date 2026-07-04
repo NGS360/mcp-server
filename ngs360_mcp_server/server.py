@@ -3,7 +3,6 @@
 from mcp.server.fastmcp import FastMCP
 
 from ngs360_mcp_server.client import NGS360Client
-from ngs360_mcp_server.wes_client import WESClient
 
 from ngs360_mcp_server.tools.runs import register_runs_tools
 from ngs360_mcp_server.tools.jobs import register_jobs_tools
@@ -30,14 +29,12 @@ def create_server() -> FastMCP:
             "files, batch jobs, workflows, pipelines, QC metrics, vendors, "
             "settings, and platforms. Also provides GA4GH Workflow Execution "
             "Service (WES) tools for submitting and monitoring workflow runs. "
-            "NGS360 tools communicate with the NGS360 REST API backend. "
-            "WES tools (prefixed with wes_) communicate with a separate "
-            "GA4GH WES API service."
+            "WES tools are prefixed with wes_."
         ),
     )
 
     client = NGS360Client()
-    wes_client = WESClient()
+    wes_client = NGS360Client(path_prefix="/ga4gh/wes/v1")
 
     # Register all tool groups
     register_runs_tools(mcp, client)
