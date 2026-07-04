@@ -44,8 +44,6 @@ The server uses environment variables for configuration:
 |----------|---------|-------------|
 | `NGS360_API_URL` | `http://localhost:8000` | Base URL of the NGS360 API |
 | `NGS360_API_TOKEN` | *(empty)* | Bearer token for NGS360 authentication |
-| `WES_API_URL` | `http://localhost:8080` | Base URL of the GA4GH WES API service |
-| `WES_API_TOKEN` | *(empty)* | Bearer token for WES authentication |
 
 ## Usage
 
@@ -67,8 +65,6 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
       "env": {
         "NGS360_API_URL": "https://your-ngs360-api.example.com",
         "NGS360_API_TOKEN": "your-bearer-token",
-        "WES_API_URL": "https://your-wes-api.example.com",
-        "WES_API_TOKEN": "your-wes-bearer-token"
       }
     }
   }
@@ -87,8 +83,6 @@ Add to your MCP settings:
       "env": {
         "NGS360_API_URL": "https://your-ngs360-api.example.com",
         "NGS360_API_TOKEN": "your-bearer-token",
-        "WES_API_URL": "https://your-wes-api.example.com",
-        "WES_API_TOKEN": "your-wes-bearer-token"
       }
     }
   }
@@ -106,7 +100,6 @@ mcp-server/
 └── ngs360_mcp_server/
     ├── __init__.py
     ├── client.py          # HTTP client wrapper for the NGS360 API
-    ├── wes_client.py      # HTTP client wrapper for the GA4GH WES API
     ├── server.py          # MCP server entry point
     └── tools/
         ├── __init__.py
@@ -122,7 +115,6 @@ mcp-server/
         ├── settings.py    # Settings tools
         ├── platforms.py   # Platform registry tools
         ├── manifest.py    # Manifest tools
-        └── wes.py         # GA4GH Workflow Execution Service tools
 ```
 
 ### Testing with MCP Inspector
@@ -185,7 +177,7 @@ This MCP server covers the full NGS360 API surface at `/api/v1/*`:
 - `POST/GET /platforms` — Platform registry
 - `GET/POST /manifest` — Manifest operations
 
-### GA4GH WES API (`/ga4gh/wes/v1/*`, separate host)
+### GA4GH WES API (`/ga4gh/wes/v1/*`)
 
 - `GET /service-info` — WES service capabilities
 - `GET /runs` — List workflow runs
