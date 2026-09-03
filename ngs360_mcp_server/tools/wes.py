@@ -1,10 +1,21 @@
 """MCP tools for the GA4GH Workflow Execution Service (WES) API."""
 
+import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from ngs360_mcp_server.client import NGS360Client
+
+
+# Conservative defaults so Sentieon (VPC) and Manta-class (STATIC) runs
+# work without caller knowledge. Caller values in workflow_engine_parameters
+# override these.
+DEFAULT_ENGINE_PARAMETERS = {
+    "networkingMode": "VPC",
+    "configurationName": "NGS360_AWSHO_Configuration",
+    "storageType": "STATIC",
+}
 
 
 def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
@@ -52,32 +63,83 @@ def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
     ) -> dict:
         """Submit a new workflow run to the WES service.
 
+        Returns 200 + a run_id even when the run fails synchronously at
+        the WES service (e.g. workflow not deployed, file resolution
+        errored). Callers must poll wes_get_run_status / wes_get_run_log
+        after submission to confirm the run actually reached RUNNING or
+        COMPLETE — do not report a run as "submitted successfully" based
+        on this call alone.
+
         Args:
-            workflow_url: URL or relative path to the workflow definition (CWL/WDL)
-            workflow_type: Workflow language type (e.g., "CWL", "WDL")
-            workflow_type_version: Version of the workflow language (e.g., "v1.0")
-            workflow_params: Input parameters for the workflow (JSON object)
-            workflow_engine: Workflow engine to use (e.g., "cromwell", "toil")
-            workflow_engine_version: Version of the workflow engine
-            workflow_engine_parameters: Additional engine-specific parameters
-            tags: Arbitrary key-value tags for the run
+            workflow_url: Workflow reference. NGS360 workflows use
+                "<workflow_id_no_dashes>:<version_or_alias>".
+            workflow_type: "CWL" or "WDL" (case-insensitive).
+            workflow_type_version: e.g. "v1.0", "v1.2". Not validated
+                server-side.
+            workflow_params: Input parameters for the workflow. File
+                inputs can be S3 URIs, or "ngs360://<file_id>" — the
+                server resolves ngs360:// references to their backing
+                S3 URIs before dispatching to Omics.
+            workflow_engine: Usually omit; inferred from the deployment.
+            workflow_engine_version: Usually omit.
+            workflow_engine_parameters: AWS Omics run options. Merged
+                on top of MCP defaults (networkingMode=VPC,
+                configurationName=NGS360_AWSHO_Configuration,
+                storageType=STATIC); anything the caller passes wins.
+                Unknown keys are silently dropped downstream — spell
+                exactly:
+                  * name (str): Run name. Falls back to tags.TaskName.
+                  * workflowVersionName (str): Pin Omics workflow version.
+                  * cacheId (str): Reuse outputs from an Omics run cache.
+                  * storageType (str): "STATIC" or "DYNAMIC".
+                  * storageCapacity (int): GiB; only with storageType=STATIC.
+                  * networkingMode (str): VPC mode.
+                  * configurationName (str): Named Omics run config;
+                    paired with networkingMode.
+                Note: outputUri is NOT accepted here — the WES service
+                constructs it unconditionally from tags.ProjectId as
+                s3://<configured_bucket>/Project/<ProjectId>/, and any
+                caller-supplied value is silently discarded.
+            tags: Tags for the run. **ProjectId is required** for audit
+                and cost tracking, and for the outputUri the WES
+                constructs. Other special keys: TaskName (fallback for
+                `name`); ProjectId is renamed to `Project` on outgoing
+                Omics tags for AWS cost tracking (DB storage keeps
+                ProjectId).
+
+        Raises:
+            ValueError: If tags is missing or does not include a
+                ProjectId. Fail-fast at the MCP layer so an LLM sees a
+                clear error and can prompt the user, instead of a raw
+                HTTP 500 from the WES service.
         """
-        body: dict[str, Any] = {
+        if not tags or not tags.get("ProjectId"):
+            raise ValueError(
+                "tags.ProjectId is required. Every WES run must be tagged "
+                "with a project identifier for audit and cost tracking. "
+                "Pass e.g. tags={'ProjectId': 'P-XXXXXXXX-XXXX', ...}."
+            )
+
+        # Merge defaults with caller-supplied engine params. Caller wins
+        # for any key present in workflow_engine_parameters.
+        merged_engine_params = {
+            **DEFAULT_ENGINE_PARAMETERS,
+            **(workflow_engine_parameters or {}),
+        }
+
+        form: dict[str, Any] = {
             "workflow_url": workflow_url,
             "workflow_type": workflow_type,
             "workflow_type_version": workflow_type_version,
+            "workflow_engine": workflow_engine,
+            "workflow_engine_version": workflow_engine_version,
+            "workflow_engine_parameters": json.dumps(merged_engine_params),
         }
         if workflow_params is not None:
-            body["workflow_params"] = workflow_params
-        if workflow_engine is not None:
-            body["workflow_engine"] = workflow_engine
-        if workflow_engine_version is not None:
-            body["workflow_engine_version"] = workflow_engine_version
-        if workflow_engine_parameters is not None:
-            body["workflow_engine_parameters"] = workflow_engine_parameters
+            form["workflow_params"] = json.dumps(workflow_params)
         if tags is not None:
-            body["tags"] = tags
-        return await wes_client.post("/runs", json=body)
+            form["tags"] = json.dumps(tags)
+        return await wes_client.post_form("/runs", data=form)
 
     @mcp.tool()
     async def wes_get_run_log(run_id: str) -> dict:

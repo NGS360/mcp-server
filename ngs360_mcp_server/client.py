@@ -78,13 +78,13 @@ class NGS360Client:
     async def _get_client(self) -> httpx.AsyncClient:
         # Deliberately no auth here: the client is shared across callers, so
         # credentials are passed per call instead.
+        # Content-Type is intentionally not defaulted — httpx sets it per
+        # request based on the body type (json/data/files), and a shared
+        # default would win over that via setdefault(), breaking form posts.
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
+                headers={"Accept": "application/json"},
                 timeout=60.0,
             )
         return self._client
@@ -118,6 +118,35 @@ class NGS360Client:
             json=json,
             data=data,
             params=params,
+            headers=self._auth_headers(),
+        )
+        resp.raise_for_status()
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            return resp.json()
+        return resp.text
+
+    async def post_form(
+        self,
+        path: str,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+    ) -> dict | list | str:
+        """POST as form data.
+
+        Sends ``application/x-www-form-urlencoded`` when only ``data`` is
+        given, and ``multipart/form-data`` when ``files`` are attached.
+        Values in ``data`` that are ``None`` are dropped so optional fields
+        do not become empty strings on the wire. Nested structures must be
+        JSON-serialized by the caller — the WES /runs endpoint expects
+        ``workflow_params``, ``tags``, and ``workflow_engine_parameters``
+        as JSON strings, not as form-encoded nested objects.
+        """
+        client = await self._get_client()
+        clean = {k: v for k, v in (data or {}).items() if v is not None}
+        resp = await client.post(
+            f"{self.path_prefix}{path}",
+            data=clean or None,
+            files=files,
             headers=self._auth_headers(),
         )
         resp.raise_for_status()
