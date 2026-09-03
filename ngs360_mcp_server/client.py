@@ -21,6 +21,8 @@ from typing import Any
 
 import httpx
 
+from ngs360_mcp_server.auth import get_caller_authorization
+
 
 def _inbound_authorization() -> str | None:
     """Return the Authorization header of the MCP request being handled.

@@ -6,6 +6,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ngs360_mcp_server.auth import forward_caller_authorization
 from ngs360_mcp_server.client import NGS360Client
 
 from ngs360_mcp_server.tools.runs import register_runs_tools
@@ -79,14 +80,31 @@ def main() -> None:
     """Run the MCP server.
 
     Transport is selected via the MCP_TRANSPORT env var, defaulting to "stdio"
-    for local use (e.g. MCP Inspector, Claude Desktop). For container
-    deployment set MCP_TRANSPORT=streamable-http; the server then serves /mcp and
-    /health on FASTMCP_HOST:FASTMCP_PORT (0.0.0.0:8000 in the container, with
-    FASTMCP_STATELESS_HTTP=true).
+    for local use (e.g. MCP Inspector, Claude Desktop). For container or
+    Elastic Beanstalk deployment set MCP_TRANSPORT=streamable-http; the server
+    then serves /mcp and /health on FASTMCP_HOST:FASTMCP_PORT (0.0.0.0:8000 by
+    default, with FASTMCP_STATELESS_HTTP=true).
+
+    Under streamable-http the ASGI app is built and served here rather than via
+    mcp.run(), which offers no way to insert middleware. The wrapper captures
+    each caller's Authorization header so downstream NGS360 calls are made as
+    the real user instead of as one shared service principal -- see
+    ngs360_mcp_server.auth.
     """
     mcp = create_server()
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
-    mcp.run(transport=transport)
+
+    if transport != "streamable-http":
+        mcp.run(transport=transport)
+        return
+
+    import uvicorn
+
+    uvicorn.run(
+        forward_caller_authorization(mcp.streamable_http_app()),
+        host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
+        port=int(os.environ.get("FASTMCP_PORT", "8000")),
+    )
 
 
 if __name__ == "__main__":
