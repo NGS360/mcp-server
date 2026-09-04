@@ -5,7 +5,11 @@ description = "MCP Server for the NGS360 API"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    # Upper bound is deliberate: this server is written against the 1.x
+    # mcp.server.fastmcp API (FastMCP, streamable_http_app, custom_route).
+    # mcp 2.x is a different SDK generation with a different dependency tree,
+    # so picking it up must be a considered migration, not a lock refresh.
+    "mcp[cli]>=1.28,<2",
     "httpx>=0.27.0",
     "pydantic>=2.0.0",
     # Imported directly by server.main to serve the streamable-HTTP ASGI app.
