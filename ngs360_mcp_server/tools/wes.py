@@ -24,20 +24,26 @@ def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
     async def wes_list_runs(
         page_size: int | None = None,
         page_token: str | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> dict:
         """List workflow runs from the WES service.
-
-        Returns a paginated list of workflow runs the caller has permission to see.
 
         Args:
             page_size: Number of runs to return per page
             page_token: Token for retrieving the next page of results
+            filters: Server-side filter as a dict. Keys match WorkflowRun
+                column names, e.g. workflow_url, state, project, user_id;
+                nested `tags` matches on tag values, e.g.
+                {"tags": {"ProjectId": "P-XXXX"}}. Unknown keys are
+                silently ignored server-side.
         """
         params: dict[str, Any] = {}
         if page_size is not None:
             params["page_size"] = page_size
         if page_token is not None:
             params["page_token"] = page_token
+        if filters is not None:
+            params["filters"] = json.dumps(filters)
         return await wes_client.get("/runs", params=params)
 
     @mcp.tool()
