@@ -56,25 +56,36 @@ class NGS360Client:
         self.base_url = (
             base_url or os.environ.get("NGS360_API_URL", "http://localhost:8000")
         ).rstrip("/")
-        # Fallback credential only — see the module docstring. Read lazily in
-        # _auth_headers so the env can be set after construction.
-        self.token = token
+        # Fallback credential, used only when the request carries none of its
+        # own -- i.e. under stdio, where the process serves a single user.
+        self.token = token or os.environ.get("NGS360_API_TOKEN", "")
         self.path_prefix = path_prefix
         self._client: httpx.AsyncClient | None = None
 
-    def _auth_headers(self) -> dict[str, str]:
-        """Build the per-request auth headers. May be empty."""
-        inbound = _inbound_authorization()
-        if inbound:
-            return {"Authorization": inbound}
+    @property
+    def _headers(self) -> dict[str, str]:
+        # Deliberately no Authorization here: the cached AsyncClient is shared
+        # by every caller, so baking a credential in would send one user's
+        # token on another user's request. Auth is resolved per request in
+        # _auth_headers() and passed at call time instead.
+        return {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
 
-        token = (
-            self.token
-            if self.token is not None
-            else os.environ.get("NGS360_API_TOKEN", "")
-        )
-        if token:
-            return {"Authorization": f"Bearer {token}"}
+    def _auth_headers(self) -> dict[str, str]:
+        """Resolve the Authorization header for the call being made.
+
+        Prefers the caller's own header, so downstream NGS360 calls are
+        attributed to the real user rather than to a shared service principal.
+        Falls back to NGS360_API_TOKEN for the stdio transport. If neither is
+        present the header is omitted and the API decides how to respond.
+        """
+        caller = get_caller_authorization()
+        if caller:
+            return {"Authorization": caller}
+        if self.token:
+            return {"Authorization": f"Bearer {self.token}"}
         return {}
 
     async def _get_client(self) -> httpx.AsyncClient:
