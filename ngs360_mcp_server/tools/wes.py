@@ -8,16 +8,6 @@ from mcp.server.fastmcp import FastMCP
 from ngs360_mcp_server.client import NGS360Client
 
 
-# Conservative defaults so Sentieon (VPC) and Manta-class (STATIC) runs
-# work without caller knowledge. Caller values in workflow_engine_parameters
-# override these.
-DEFAULT_ENGINE_PARAMETERS = {
-    "networkingMode": "VPC",
-    "configurationName": "NGS360_AWSHO_Configuration",
-    "storageType": "STATIC",
-}
-
-
 def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
     """Register all GA4GH WES-related tools with the MCP server."""
 
@@ -58,7 +48,7 @@ def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
         workflow_params: dict[str, Any] | None = None,
         workflow_engine: str | None = None,
         workflow_engine_version: str | None = None,
-        workflow_engine_parameters: dict[str, str] | None = None,
+        workflow_engine_parameters: dict[str, Any] | None = None,
         tags: dict[str, str] | None = None,
     ) -> dict:
         """Submit a new workflow run to the WES service.
@@ -82,18 +72,20 @@ def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
                 S3 URIs before dispatching to Omics.
             workflow_engine: Usually omit; inferred from the deployment.
             workflow_engine_version: Usually omit.
-            workflow_engine_parameters: AWS Omics run options. Merged
-                on top of MCP defaults (networkingMode=VPC,
-                configurationName=NGS360_AWSHO_Configuration,
-                storageType=STATIC); anything the caller passes wins.
+            workflow_engine_parameters: AWS Omics run options. No
+                defaults are applied — callers decide explicitly.
                 Unknown keys are silently dropped downstream — spell
                 exactly:
                   * name (str): Run name. Falls back to tags.TaskName.
                   * workflowVersionName (str): Pin Omics workflow version.
                   * cacheId (str): Reuse outputs from an Omics run cache.
-                  * storageType (str): "STATIC" or "DYNAMIC".
+                  * storageType (str): "STATIC" or "DYNAMIC". If set to
+                    STATIC and the workflow was registered as DYNAMIC,
+                    also pass storageCapacity or Omics will reject.
                   * storageCapacity (int): GiB; only with storageType=STATIC.
-                  * networkingMode (str): VPC mode.
+                  * networkingMode (str): "VPC" for workflows that call
+                    licensed servers (e.g. Sentieon); must be paired
+                    with configurationName.
                   * configurationName (str): Named Omics run config;
                     paired with networkingMode.
                 Note: outputUri is NOT accepted here — the WES service
@@ -120,23 +112,17 @@ def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
                 "Pass e.g. tags={'ProjectId': 'P-XXXXXXXX-XXXX', ...}."
             )
 
-        # Merge defaults with caller-supplied engine params. Caller wins
-        # for any key present in workflow_engine_parameters.
-        merged_engine_params = {
-            **DEFAULT_ENGINE_PARAMETERS,
-            **(workflow_engine_parameters or {}),
-        }
-
         form: dict[str, Any] = {
             "workflow_url": workflow_url,
             "workflow_type": workflow_type,
             "workflow_type_version": workflow_type_version,
             "workflow_engine": workflow_engine,
             "workflow_engine_version": workflow_engine_version,
-            "workflow_engine_parameters": json.dumps(merged_engine_params),
         }
         if workflow_params is not None:
             form["workflow_params"] = json.dumps(workflow_params)
+        if workflow_engine_parameters is not None:
+            form["workflow_engine_parameters"] = json.dumps(workflow_engine_parameters)
         if tags is not None:
             form["tags"] = json.dumps(tags)
         return await wes_client.post_form("/runs", data=form)
