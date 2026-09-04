@@ -1,1 +1,1 @@
-web: ngs360-mcp-server
+web: python -m ngs360_mcp_server.server

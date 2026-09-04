@@ -3,3 +3,8 @@ __pycache__
 dist/
 build/
 run.sh
+
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
