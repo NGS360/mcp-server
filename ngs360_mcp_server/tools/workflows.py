@@ -491,7 +491,11 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
                 source .cwl file. Packed with cwltool; its containing
                 directory is inspected for git provenance.
             name: Human-readable workflow name shown in the NGS360 UI
-                and Omics console.
+                and Omics console. Prefer the CWL file's top-level
+                ``label`` field if present — that's the workflow
+                author's canonical name (e.g. "WES alignment
+                (Translational)"). Fall back to the filename without
+                ``.cwl`` if the CWL has no label.
 
         Returns:
             workflow_id: NGS360 Workflow UUID
