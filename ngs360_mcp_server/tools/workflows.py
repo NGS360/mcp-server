@@ -121,6 +121,20 @@ async def _upload_packed_cwl(
     return str(resp["id"])
 
 
+async def _check_workflow_exists(
+    client: NGS360Client, workflow_id: str,
+) -> None:
+    """Verify a workflow exists before doing pack + upload work.
+
+    Mirrors register_ngs360_workflow.sh's check_workflow_exists. Fails
+    fast on a wrong workflow_id or wrong-environment mistake, saving
+    the 30-90s of cwltool --pack + upload that would otherwise be
+    wasted before create_workflow_version hits 404. GET is anonymous;
+    the response body is discarded, only the status matters.
+    """
+    await client.get(f"/workflows/{workflow_id}")
+
+
 async def _resolve_latest_version(
     client: NGS360Client, workflow_id: str,
 ) -> int:
@@ -530,6 +544,11 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         """
         if not os.path.isfile(cwl_path):
             raise ValueError(f"CWL file not found: {cwl_path}")
+
+        # Preflight the workflow_id before packing/uploading — a wrong id
+        # or wrong-environment mistake used to strand a packed CWL upload
+        # in S3 before the deploy step surfaced the 404.
+        await _check_workflow_exists(client, workflow_id)
 
         packed = _pack_cwl(cwl_path)
         attributes = _git_attributes_for_path(cwl_path)
