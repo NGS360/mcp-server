@@ -1,5 +1,6 @@
 """MCP tools for the Files API."""
 
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -177,3 +178,51 @@ def register_files_tools(mcp: FastMCP, client: NGS360Client) -> None:
             uri: S3 URI to list (e.g., s3://bucket/folder/)
         """
         return await client.get("/files/list", params={"uri": uri})
+
+    @mcp.tool()
+    async def upload_file(
+        local_path: str,
+        project_id: str,
+        relative_path: str,
+        filename: str | None = None,
+    ) -> dict:
+        """Upload a local file to NGS360 and create its file record.
+
+        POSTs multipart/form-data to /files/upload. The API server writes
+        the bytes to its configured storage backend, then creates a
+        File row and returns it (including the new file id).
+
+        Path is on the MCP server's local filesystem — under stdio
+        transport that's the user's own machine, so a path like
+        "/tmp/wgs.packed.cwl" refers to the caller's local file. HTTP
+        transport would need the file uploaded to the server host first.
+
+        Callers that want the timestamped filename convention used by
+        register_ngs360_workflow.sh (avoiding accidental overwrites on
+        re-run) should pass the timestamp themselves via ``filename``;
+        this tool does not modify the name so a caller uploading a
+        specific artifact name gets exactly what they asked for.
+
+        Args:
+            local_path: Path to the file on the MCP server's filesystem.
+            project_id: Project business key (e.g. "P-XXXXXXXX-XXXX")
+                that scopes the upload.
+            relative_path: Path prefix within the project. Workflow
+                registration uses "workflow_definition_file".
+            filename: Name to record on the server side. Defaults to
+                ``basename(local_path)``.
+        """
+        if not os.path.isfile(local_path):
+            raise ValueError(f"local file not found: {local_path}")
+        upload_name = filename or os.path.basename(local_path)
+        with open(local_path, "rb") as fh:
+            content = fh.read()
+        return await client.post_form(
+            "/files/upload",
+            data={
+                "filename": upload_name,
+                "relative_path": relative_path,
+                "project_id": project_id,
+            },
+            files={"content": (upload_name, content)},
+        )
