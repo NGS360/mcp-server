@@ -19,6 +19,48 @@ _UPLOAD_PROJECT_ID = "P-00000000-0001"
 _UPLOAD_RELATIVE_PATH = "workflow_definition_file"
 
 
+def _require_stdio_transport(tool_name: str, sibling: str) -> None:
+    """Guard for tools that need local filesystem access on the MCP
+    server host.
+
+    Under remote (streamable-http) transport the "local" path arg
+    resolves on the *deployed* server host, not the caller's machine —
+    so a path like /tmp/wgs.cwl either doesn't exist or is silently the
+    wrong file. Fail loud instead of silently succeeding, and point the
+    caller at the sibling tool that accepts an already-uploaded file id.
+    """
+    if os.environ.get("MCP_TRANSPORT") == "streamable-http":
+        raise RuntimeError(
+            f"{tool_name} needs a file on the MCP server's local "
+            "filesystem, which is not available under remote "
+            f"(streamable-http) transport. Use {sibling} instead — see "
+            "its docstring for step-by-step instructions on packing and "
+            "uploading the CWL manually before calling it."
+        )
+
+
+def _git_attributes_from_args(
+    git_commit: str | None,
+    git_repo: str | None,
+    git_ref: str | None,
+) -> list[dict[str, str]]:
+    """Assemble the git-attributes list from explicit arg values.
+
+    Used by the ``*_from_file_id`` composites, where the CWL is not on
+    the server's filesystem so we can't run ``git rev-parse`` ourselves.
+    Callers who have git provenance (from their own local checkout)
+    pass it in; unprovided keys simply don't get attached.
+    """
+    attrs: list[dict[str, str]] = []
+    if git_commit:
+        attrs.append({"key": "git_commit", "value": git_commit})
+    if git_repo:
+        attrs.append({"key": "git_repo", "value": git_repo})
+    if git_ref:
+        attrs.append({"key": "git_ref", "value": git_ref})
+    return attrs
+
+
 def _pack_cwl(src: str) -> bytes:
     """Run ``cwltool --pack`` against ``src`` and return the packed bytes.
 
@@ -502,7 +544,16 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             version_num: WorkflowVersion number (always 1 for a new workflow)
             file_id: NGS360 File UUID of the packed CWL
             omics_arn: Full Omics workflow ARN
+
+        Under remote MCP transport (streamable-http) this tool cannot
+        work — cwl_path resolves on the server host, not the caller's
+        machine. Use ``register_workflow_from_file_id`` instead after
+        packing and uploading the CWL manually; see that tool's
+        docstring for the step-by-step curl guidance.
         """
+        _require_stdio_transport(
+            "register_workflow", "register_workflow_from_file_id",
+        )
         if not os.path.isfile(cwl_path):
             raise ValueError(f"CWL file not found: {cwl_path}")
 
@@ -545,7 +596,16 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             version_num: new WorkflowVersion number (server auto-increments)
             file_id: NGS360 File UUID of the packed CWL
             omics_arn: Full Omics workflow ARN for this new version
+
+        Under remote MCP transport (streamable-http) this tool cannot
+        work — cwl_path resolves on the server host, not the caller's
+        machine. Use ``update_workflow_from_file_id`` instead after
+        packing and uploading the CWL manually; see that tool's
+        docstring for the step-by-step curl guidance.
         """
+        _require_stdio_transport(
+            "update_workflow", "update_workflow_from_file_id",
+        )
         if not os.path.isfile(cwl_path):
             raise ValueError(f"CWL file not found: {cwl_path}")
 
@@ -558,6 +618,146 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         attributes = _git_attributes_for_path(cwl_path)
         upload_name = _timestamped_upload_name(cwl_path)
         file_id = await _upload_packed_cwl(client, packed, upload_name)
+
+        version_num, omics_arn = await _create_version_and_deploy(
+            client, workflow_id, file_id, attributes,
+        )
+        return {
+            "workflow_id": workflow_id,
+            "version_num": version_num,
+            "file_id": file_id,
+            "omics_arn": omics_arn,
+        }
+
+    # ------------------------------------------------------------------
+    # Composite tools for remote MCP (no local filesystem) — caller has
+    # already uploaded the packed CWL and hands us the file_id.
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def register_workflow_from_file_id(
+        file_id: str,
+        name: str,
+        git_commit: str | None = None,
+        git_repo: str | None = None,
+        git_ref: str | None = None,
+    ) -> dict:
+        """Register a NEW workflow when the caller already has a packed
+        CWL uploaded to NGS360 (i.e. has a ``file_id`` in hand). Use
+        this when running under remote MCP transport (no local
+        filesystem) or in any other flow where the CWL is already
+        uploaded.
+
+        Runs create-workflow → create-version → deploy against the
+        given ``file_id``. Skips packing, uploading, and local git-
+        provenance capture. Git values may be passed in explicitly for
+        the same traceability the local composite provides.
+
+        Deploys to ``AWSHealthOmics (us-east)`` — the server auto-
+        registers on Omics via a Lambda and returns the ARN.
+
+        If the caller does NOT yet have a file_id, guide the user
+        through these steps first (in a UI or chat, before calling
+        this tool):
+
+          1. Install cwltool (once, per machine):
+                 pip install cwltool
+
+          2. Pack the CWL locally:
+                 cwltool --pack <path/to/workflow.cwl> > packed.cwl
+
+          3. Set NGS360 auth env vars (once, per shell):
+                 export NGS360_API_ENDPOINT=https://ngs.rdcloud.bms.com/api/v1
+                 export NGS360_AUTH_TOKEN=<their bearer token>
+
+          4. Upload the packed CWL and capture the file id from the JSON
+             response (its ``id`` field):
+                 curl -s -X POST "$NGS360_API_ENDPOINT/files/upload" \\
+                   -H "Authorization: Bearer $NGS360_AUTH_TOKEN" \\
+                   -F "filename=<name>.packed.cwl" \\
+                   -F "relative_path=workflow_definition_file" \\
+                   -F "project_id=P-00000000-0001" \\
+                   -F "content=@packed.cwl"
+
+          5. Optional but strongly encouraged — capture git provenance
+             so the version has the same traceability tags as a
+             locally-registered workflow:
+                 git rev-parse HEAD                    # → git_commit
+                 git remote get-url origin             # → git_repo
+                 git rev-parse --abbrev-ref HEAD       # → git_ref
+
+          6. Call this tool with the file_id and (optional) git values.
+
+        Args:
+            file_id: NGS360 File UUID of the already-uploaded packed CWL.
+            name: Human-readable workflow name shown in the NGS360 UI
+                and Omics console. Prefer the CWL file's top-level
+                ``label`` field if the user has it; otherwise the base
+                filename without ``.cwl``.
+            git_commit: Optional git SHA (or ``<sha>+dirty``) captured
+                from the CWL's source repo. Skipped if not provided.
+            git_repo: Optional git repo URL (e.g. ``git remote get-url
+                origin`` output). Skipped if not provided.
+            git_ref: Optional branch/tag name from the CWL's source
+                repo (e.g. ``main``). Skipped if not provided.
+
+        Returns:
+            workflow_id: NGS360 Workflow UUID
+            version_num: WorkflowVersion number (always 1 for a new workflow)
+            file_id: echo of the argument
+            omics_arn: Full Omics workflow ARN
+        """
+        attributes = _git_attributes_from_args(git_commit, git_repo, git_ref)
+
+        wf_resp = await client.post("/workflows", json={"name": name})
+        workflow_id = str(wf_resp["id"])
+
+        version_num, omics_arn = await _create_version_and_deploy(
+            client, workflow_id, file_id, attributes,
+        )
+        return {
+            "workflow_id": workflow_id,
+            "version_num": version_num,
+            "file_id": file_id,
+            "omics_arn": omics_arn,
+        }
+
+    @mcp.tool()
+    async def update_workflow_from_file_id(
+        file_id: str,
+        workflow_id: str,
+        git_commit: str | None = None,
+        git_repo: str | None = None,
+        git_ref: str | None = None,
+    ) -> dict:
+        """Add a new version to an EXISTING workflow when the caller
+        already has the packed CWL uploaded to NGS360. Remote-MCP
+        counterpart to ``update_workflow``.
+
+        Runs create-version → deploy against the given ``file_id`` and
+        ``workflow_id``. Preflight-checks that the workflow exists
+        before doing any work.
+
+        If the caller does NOT yet have a file_id, walk the user
+        through the pack + upload steps documented on
+        ``register_workflow_from_file_id`` — the same procedure
+        applies. Only the last step (which tool to call) differs.
+
+        Args:
+            file_id: NGS360 File UUID of the already-uploaded packed CWL.
+            workflow_id: NGS360 Workflow UUID to add the new version under.
+            git_commit: Optional. See register_workflow_from_file_id docs.
+            git_repo: Optional. See register_workflow_from_file_id docs.
+            git_ref: Optional. See register_workflow_from_file_id docs.
+
+        Returns:
+            workflow_id: echo of the argument
+            version_num: new WorkflowVersion number
+            file_id: echo of the argument
+            omics_arn: Full Omics workflow ARN for this new version
+        """
+        await _check_workflow_exists(client, workflow_id)
+        attributes = _git_attributes_from_args(git_commit, git_repo, git_ref)
 
         version_num, omics_arn = await _create_version_and_deploy(
             client, workflow_id, file_id, attributes,
