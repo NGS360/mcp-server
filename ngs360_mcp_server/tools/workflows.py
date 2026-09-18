@@ -667,7 +667,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
                  cwltool --pack <path/to/workflow.cwl> > packed.cwl
 
           3. Set NGS360 auth env vars (once, per shell):
-                 export NGS360_API_ENDPOINT=https://ngs.rdcloud.bms.com/api/v1
+                 export NGS360_API_ENDPOINT=<your NGS360 API base URL, ending in /api/v1>
                  export NGS360_AUTH_TOKEN=<their bearer token>
 
           4. Upload the packed CWL and capture the file id from the JSON
