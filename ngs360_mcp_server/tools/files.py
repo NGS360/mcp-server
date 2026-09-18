@@ -194,8 +194,25 @@ def register_files_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         Path is on the MCP server's local filesystem — under stdio
         transport that's the user's own machine, so a path like
-        "/tmp/wgs.packed.cwl" refers to the caller's local file. HTTP
-        transport would need the file uploaded to the server host first.
+        "/tmp/wgs.packed.cwl" refers to the caller's local file.
+
+        Under remote MCP transport (streamable-http) this tool cannot
+        be used — ``local_path`` resolves on the deployed server host,
+        not the caller's machine. Instead, guide the user to run the
+        equivalent curl themselves and use the returned file id:
+
+            export NGS360_API_ENDPOINT=<NGS360 API base URL, ending in /api/v1>
+            export NGS360_AUTH_TOKEN=<their bearer token>
+
+            curl -s -X POST "$NGS360_API_ENDPOINT/files/upload" \\
+              -H "Authorization: Bearer $NGS360_AUTH_TOKEN" \\
+              -F "filename=<name>" \\
+              -F "relative_path=<path prefix within the project>" \\
+              -F "project_id=<project id>" \\
+              -F "content=@<local-path-to-file>"
+
+        The response JSON has an ``id`` field — that's the file id to
+        hand to whatever tool consumes it next.
 
         Callers that want the timestamped filename convention used by
         register_ngs360_workflow.sh (avoiding accidental overwrites on
