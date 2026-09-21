@@ -11,7 +11,7 @@ This MCP server wraps the NGS360 bioinformatics platform API, providing tools fo
 | **Runs** | 14 tools | Sequencing run CRUD, sample sheets, metrics, demultiplexing |
 | **Jobs** | 6 tools | AWS Batch job submission, monitoring, and logs |
 | **Projects** | 11 tools | Project CRUD, samples, pipeline actions, vendor ingestion |
-| **Files** | 7 tools | File record management, S3 browsing |
+| **Files** | 9 tools | File record management, S3 browsing, uploads, presigned downloads |
 | **Search** | 1 tool | Cross-index search (projects, runs, samples) |
 | **Workflows** | 11 tools | Workflow identity, versions, aliases, deployments |
 | **Pipelines** | 5 tools | Pipeline CRUD, workflow associations |
@@ -163,6 +163,8 @@ This MCP server covers the full NGS360 API surface at `/api/v1/*`:
 - `POST/GET /files` — File record management
 - `GET/PATCH/DELETE /files/{file_id}` — File operations
 - `GET /files/list` — S3 browser
+- `POST /files/upload` — File upload
+- `GET /files/download-url` — Presigned download URL
 - `GET /search` — Global search
 - `POST/GET /workflows` — Workflow identity
 - `POST/GET /workflows/{id}/versions` — Versions

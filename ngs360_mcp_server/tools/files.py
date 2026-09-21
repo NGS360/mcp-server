@@ -243,3 +243,16 @@ def register_files_tools(mcp: FastMCP, client: NGS360Client) -> None:
             },
             files={"content": (upload_name, content)},
         )
+
+    @mcp.tool()
+    async def get_file_download_url(path: str) -> dict:
+        """Get a temporary presigned URL to download a file from S3.
+
+        Returns a time-limited URL that the caller can use to download the file
+        directly from S3 (the API does not stream file bytes). The URL is a
+        bearer credential — treat it as secret and use it before it expires.
+
+        Args:
+            path: S3 URI of the file (e.g., s3://bucket/path/file.bam)
+        """
+        return await client.get("/files/download-url", params={"path": path})
