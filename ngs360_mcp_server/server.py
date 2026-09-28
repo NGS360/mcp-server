@@ -9,6 +9,7 @@ from starlette.responses import JSONResponse
 from ngs360_mcp_server.auth import forward_caller_authorization
 from ngs360_mcp_server.client import NGS360Client
 
+from ngs360_mcp_server.tools.auth import register_auth_tools
 from ngs360_mcp_server.tools.runs import register_runs_tools
 from ngs360_mcp_server.tools.jobs import register_jobs_tools
 from ngs360_mcp_server.tools.projects import register_projects_tools
@@ -59,6 +60,7 @@ def create_server() -> FastMCP:
     wes_client = NGS360Client(path_prefix="/ga4gh/wes/v1")
 
     # Register all tool groups
+    register_auth_tools(mcp, client)
     register_runs_tools(mcp, client)
     register_jobs_tools(mcp, client)
     register_projects_tools(mcp, client)

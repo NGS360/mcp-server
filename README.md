@@ -8,6 +8,7 @@ This MCP server wraps the NGS360 bioinformatics platform API, providing tools fo
 
 | Domain | Tools | Description |
 |--------|-------|-------------|
+| **Auth** | 1 tool | Current-user profile (whoami) |
 | **Runs** | 14 tools | Sequencing run CRUD, sample sheets, metrics, demultiplexing |
 | **Jobs** | 6 tools | AWS Batch job submission, monitoring, and logs |
 | **Projects** | 11 tools | Project CRUD, samples, pipeline actions, vendor ingestion |
@@ -103,6 +104,7 @@ mcp-server/
     ├── server.py          # MCP server entry point
     └── tools/
         ├── __init__.py
+        ├── auth.py        # Auth / current-user tools
         ├── runs.py        # Sequencing run tools
         ├── jobs.py        # Batch job tools
         ├── projects.py    # Project & sample tools
@@ -147,6 +149,7 @@ async def my_new_tool(param1: str, param2: int = 10) -> dict:
 
 This MCP server covers the full NGS360 API surface at `/api/v1/*`:
 
+- `GET /auth/me` — Authenticated user profile (whoami)
 - `POST/GET /runs` — Create and list sequencing runs
 - `GET/PUT /runs/{run_id}` — Get/update a run
 - `GET /runs/{run_id}/samplesheet` — Sample sheet
