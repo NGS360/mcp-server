@@ -1,11 +1,13 @@
 """MCP tools for the Workflows API."""
 
+import json
 import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 from ngs360_mcp_server.client import NGS360Client
@@ -163,6 +165,201 @@ async def _upload_packed_cwl(
     return str(resp["id"])
 
 
+# ----------------------------------------------------------------------
+# Input/output schema capture
+#
+# Every registration path records the workflow's parameter schema on the
+# WorkflowVersion (the API's inputs/outputs JSON columns), so consumers
+# can see what a workflow needs without re-reading its CWL.
+#
+# Capture is best-effort by design: it is enrichment, and failing a
+# registration that otherwise succeeded would be the worse outcome. The
+# helpers below therefore return a warning string instead of raising,
+# and the composites surface it on their result as ``io_warning`` so a
+# silent fallback to null inputs/outputs cannot go unnoticed.
+# ----------------------------------------------------------------------
+
+_NGS360_URI_SCHEME = "ngs360://"
+
+
+def _cwl_short_id(raw_id: Any) -> str:
+    """``#main/sample_id`` -> ``sample_id``; also shortens enum symbols."""
+    return str(raw_id).rsplit("/", 1)[-1]
+
+
+def _cwl_type(spec: Any) -> str:
+    """Render a packed CWL type in CWL's shorthand.
+
+    Packing normalizes ``File?`` to ``["null", "File"]`` and ``File[]``
+    to an array dict, so only those forms need handling. Unions render
+    as ``(float|string)`` and enums keep their symbols as
+    ``enum(WES|WGS)`` — the allowed values are most of the point of
+    knowing a parameter is an enum.
+    """
+    if isinstance(spec, list):
+        members = [_cwl_type(m) for m in spec if m != "null"]
+        rendered = members[0] if len(members) == 1 else f"({'|'.join(members)})"
+        return f"{rendered}?" if "null" in spec else rendered
+    if isinstance(spec, dict):
+        kind = spec.get("type")
+        if kind == "array":
+            return f"{_cwl_type(spec['items'])}[]"
+        if kind == "enum":
+            return f"enum({'|'.join(_cwl_short_id(s) for s in spec['symbols'])})"
+        if kind == "record":
+            return f"record({','.join(_cwl_short_id(f['name']) for f in spec['fields'])})"
+        return _cwl_type(kind)
+    return str(spec)
+
+
+def _cwl_doc(param: dict) -> str | None:
+    """Prefer ``doc``, fall back to ``label``; ``doc`` may be a list."""
+    text = param.get("doc") or param.get("label")
+    if isinstance(text, list):
+        text = "\n".join(text)
+    return text.strip() if text else None
+
+
+def _io_from_packed_bytes(
+    packed: bytes,
+) -> tuple[list[dict] | None, list[dict] | None, str | None]:
+    """Extract (inputs, outputs, warning) from ``cwltool --pack`` output.
+
+    Shapes match the API's WorkflowInput / WorkflowOutput models. An
+    input is ``required`` unless its type is optional or it declares a
+    default.
+
+    Assumes cwltool's packed form, which the local flows guarantee by
+    packing first. The remote flows parse whatever was uploaded, so
+    anything unexpected is caught here and reported as a warning rather
+    than raised: schema capture is enrichment and must never fail a
+    registration. On failure both lists are ``None``, never ``[]`` —
+    the columns are nullable precisely so "never captured" stays
+    distinguishable from "declares no parameters".
+    """
+    def fail(reason: str) -> tuple[None, None, str]:
+        return None, None, f"inputs/outputs were not recorded: {reason}"
+
+    try:
+        doc = json.loads(packed)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return fail(
+            "definition is not JSON. Expected the output of 'cwltool --pack "
+            f"<file>.cwl'; a source .cwl in YAML will not parse ({exc})"
+        )
+
+    try:
+        # A lone tool packs to a bare process; a workflow packs to a
+        # $graph of every process it references. Either way cwltool
+        # names the entry "#main", and only its parameters are the
+        # workflow's own.
+        graph = doc.get("$graph", [doc])
+        main = next((p for p in graph if p.get("id") == "#main"), None)
+        if main is None:
+            return fail("no '#main' process found; is this cwltool --pack output?")
+
+        inputs = []
+        for param in main.get("inputs", []):
+            type_str = _cwl_type(param["type"])
+            entry: dict[str, Any] = {
+                "id": _cwl_short_id(param["id"]),
+                "type": type_str,
+                "required": not (type_str.endswith("?") or "default" in param),
+            }
+            if text := _cwl_doc(param):
+                entry["doc"] = text
+            if "default" in param:
+                entry["default"] = param["default"]
+            inputs.append(entry)
+
+        outputs = []
+        for param in main.get("outputs", []):
+            entry = {"id": _cwl_short_id(param["id"]), "type": _cwl_type(param["type"])}
+            if text := _cwl_doc(param):
+                entry["doc"] = text
+            outputs.append(entry)
+
+        # cwltool writes a `.inf` / `.nan` default as bare Infinity / NaN,
+        # which json.loads accepts but the request body cannot carry.
+        json.dumps([inputs, outputs], allow_nan=False)
+    except Exception as exc:  # deliberately broad; see docstring
+        return fail(f"could not read the packed CWL ({type(exc).__name__}: {exc})")
+
+    return inputs, outputs, None
+
+
+async def _presigned_bytes(client: NGS360Client, s3_uri: str) -> bytes:
+    """Fetch the contents of an s3:// object via the API's presigned URL.
+
+    Two hops: GET /files/download-url signs the object with the caller's
+    own credential, then the URL itself is fetched. The second request
+    deliberately uses a throwaway httpx client rather than NGS360Client
+    — the presigned URL points at S3, not the API, and the shared
+    client would both prefix the API path and attach the NGS360
+    Authorization header to a foreign host.
+    """
+    presigned = await client.get("/files/download-url", params={"path": s3_uri})
+    if not isinstance(presigned, dict) or not presigned.get("url"):
+        raise RuntimeError(
+            f"unexpected /files/download-url response for {s3_uri}: {presigned}"
+        )
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
+        resp = await http.get(str(presigned["url"]))
+        resp.raise_for_status()
+        return resp.content
+
+
+async def _definition_bytes(
+    client: NGS360Client, definition_uri: str,
+) -> bytes:
+    """Download the CWL a definition_uri points at.
+
+    Handles both schemes the API accepts: ``ngs360://<file-id>`` is
+    resolved through GET /files/{id} to its underlying s3:// URI, and
+    ``s3://`` is presigned directly.
+    """
+    if definition_uri.startswith(_NGS360_URI_SCHEME):
+        file_id = definition_uri[len(_NGS360_URI_SCHEME):].strip("/")
+        record = await client.get(f"/files/{file_id}")
+        if not isinstance(record, dict) or not record.get("uri"):
+            raise RuntimeError(
+                f"file {file_id} has no 'uri' to download: {record}"
+            )
+        return await _presigned_bytes(client, str(record["uri"]))
+
+    if definition_uri.startswith("s3://"):
+        return await _presigned_bytes(client, definition_uri)
+
+    raise RuntimeError(
+        f"cannot download definition_uri '{definition_uri}' — expected "
+        "'ngs360://<file-id>' or 's3://'"
+    )
+
+
+async def _io_for_definition_uri(
+    client: NGS360Client, definition_uri: str,
+) -> tuple[list[dict] | None, list[dict] | None, str | None]:
+    """Extract (inputs, outputs, warning) for an already-uploaded CWL.
+
+    This is what makes schema capture work when the CWL is *not* on the
+    MCP server's filesystem — the remote-transport flows, where the
+    caller packed and uploaded the file themselves and hands over only
+    a file id. Rather than asking them to also transcribe the parameter
+    list, the server downloads the very bytes it is about to register
+    and reads the schema off them. That also makes the recorded schema
+    provably the one belonging to the stored definition.
+    """
+    try:
+        raw = await _definition_bytes(client, definition_uri)
+    except (httpx.HTTPError, RuntimeError, KeyError) as exc:
+        return None, None, (
+            "inputs/outputs were not recorded: could not download "
+            f"{definition_uri} to read its schema ({exc}). The version "
+            "was still created; re-record the schema later if needed."
+        )
+    return _io_from_packed_bytes(raw)
+
+
 async def _check_workflow_exists(
     client: NGS360Client, workflow_id: str,
 ) -> None:
@@ -201,6 +398,8 @@ async def _create_version_and_deploy(
     workflow_id: str,
     file_id: str,
     attributes: list[dict[str, str]],
+    inputs: list[dict] | None = None,
+    outputs: list[dict] | None = None,
 ) -> tuple[int, str]:
     """Create a new WorkflowVersion pointing at ``file_id`` and deploy it
     to Omics via the auto-register path. Returns (version_num, arn).
@@ -208,10 +407,20 @@ async def _create_version_and_deploy(
     Extracted so register_workflow and update_workflow share the tail
     end of the chain — the only thing that differs between them is
     whether a Workflow row already exists.
+
+    ``inputs``/``outputs`` are the CWL parameter schema (see
+    _io_from_packed_bytes). Empty lists are sent as-is rather than
+    dropped: a workflow genuinely declaring no outputs is a fact worth
+    recording, and distinguishable from "never captured" (null) only if
+    the empty list survives.
     """
     version_body: dict[str, Any] = {"definition_uri": f"ngs360://{file_id}"}
     if attributes:
         version_body["attributes"] = attributes
+    if inputs is not None:
+        version_body["inputs"] = inputs
+    if outputs is not None:
+        version_body["outputs"] = outputs
     version_resp = await client.post(
         f"/workflows/{workflow_id}/versions", json=version_body,
     )
@@ -286,7 +495,11 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
     @mcp.tool()
     async def create_workflow_version(
-        workflow_id: str, definition_uri: str
+        workflow_id: str,
+        definition_uri: str,
+        inputs: list[dict] | None = None,
+        outputs: list[dict] | None = None,
+        capture_io: bool = True,
     ) -> dict:
         """Create a new version for a workflow (row only, no deploy).
 
@@ -300,14 +513,54 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         Version number is auto-incremented.
 
+        The CWL's input/output schema is recorded on the version. By
+        default it is read off the definition itself: the server
+        downloads ``definition_uri`` and parses its parameters, so the
+        stored schema is provably the one belonging to the stored
+        definition. Failure to download or parse is not fatal — the
+        version is still created, and the response carries an
+        ``io_warning``.
+
         Args:
             workflow_id: The workflow UUID
-            definition_uri: URI to the workflow definition file
+            definition_uri: URI to the workflow definition file —
+                ``ngs360://<file_id>`` or ``s3://...``
+            inputs: Optional explicit input schema, which skips the
+                download-and-parse. Each entry is
+                ``{"id", "type", "required", "doc"?, "default"?}``.
+                Supply this only to correct or supplement what the CWL
+                declares; normally leave it unset.
+            outputs: Optional explicit output schema. Each entry is
+                ``{"id", "type", "doc"?}``.
+            capture_io: Set False to create the version with no schema
+                at all (neither parsed nor supplied). Use when the
+                definition is not reachable and the schema is unknown.
         """
-        return await client.post(
-            f"/workflows/{workflow_id}/versions",
-            json={"definition_uri": definition_uri},
+        body: dict[str, Any] = {"definition_uri": definition_uri}
+        io_warning: str | None = None
+
+        if inputs is not None or outputs is not None:
+            # Caller knows better than the file — take what they gave
+            # and don't second-guess it with a download.
+            if inputs is not None:
+                body["inputs"] = inputs
+            if outputs is not None:
+                body["outputs"] = outputs
+        elif capture_io:
+            parsed_in, parsed_out, io_warning = await _io_for_definition_uri(
+                client, definition_uri,
+            )
+            if parsed_in is not None:
+                body["inputs"] = parsed_in
+            if parsed_out is not None:
+                body["outputs"] = parsed_out
+
+        resp = await client.post(
+            f"/workflows/{workflow_id}/versions", json=body,
         )
+        if io_warning and isinstance(resp, dict):
+            resp = {**resp, "io_warning": io_warning}
+        return resp
 
     @mcp.tool()
     async def list_workflow_versions(workflow_id: str) -> list:
@@ -528,6 +781,11 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         Deploys to ``AWSHealthOmics (us-east)`` — the server auto-
         registers on Omics via a Lambda and returns the ARN.
 
+        The workflow's input/output schema (parameter ids, types,
+        required-ness, docs and defaults) is read from the packed CWL
+        and recorded on the version, so later callers can see what the
+        workflow needs without re-reading its definition.
+
         Args:
             cwl_path: Local path (on the MCP server's filesystem) to the
                 source .cwl file. Packed with cwltool; its containing
@@ -544,6 +802,10 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             version_num: WorkflowVersion number (always 1 for a new workflow)
             file_id: NGS360 File UUID of the packed CWL
             omics_arn: Full Omics workflow ARN
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if the schema could not be read
+            io_warning: present only when the schema could not be read —
+                registration still succeeded. Relay it to the user.
 
         Under remote MCP transport (streamable-http) this tool cannot
         work — cwl_path resolves on the server host, not the caller's
@@ -559,6 +821,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         packed = _pack_cwl(cwl_path)
         attributes = _git_attributes_for_path(cwl_path)
+        inputs, outputs, io_warning = _io_from_packed_bytes(packed)
         upload_name = _timestamped_upload_name(cwl_path)
         file_id = await _upload_packed_cwl(client, packed, upload_name)
 
@@ -566,14 +829,19 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         workflow_id = str(wf_resp["id"])
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
-        return {
+        result = {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            "inputs_recorded": len(inputs) if inputs is not None else None,
+            "outputs_recorded": len(outputs) if outputs is not None else None,
         }
+        if io_warning:
+            result["io_warning"] = io_warning
+        return result
 
     @mcp.tool()
     async def update_workflow(
@@ -584,8 +852,9 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         Runs pack → upload → create-version → deploy against the given
         workflow_id. Skips the workflow-creation step of
-        register_workflow. Everything else (git capture, timestamped
-        upload, Omics auto-register) matches.
+        register_workflow. Everything else (git capture, input/output
+        schema capture, timestamped upload, Omics auto-register)
+        matches.
 
         Args:
             cwl_path: Local path to the source .cwl file.
@@ -596,6 +865,10 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             version_num: new WorkflowVersion number (server auto-increments)
             file_id: NGS360 File UUID of the packed CWL
             omics_arn: Full Omics workflow ARN for this new version
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if the schema could not be read
+            io_warning: present only when the schema could not be read —
+                the new version was still created. Relay it to the user.
 
         Under remote MCP transport (streamable-http) this tool cannot
         work — cwl_path resolves on the server host, not the caller's
@@ -616,18 +889,24 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         packed = _pack_cwl(cwl_path)
         attributes = _git_attributes_for_path(cwl_path)
+        inputs, outputs, io_warning = _io_from_packed_bytes(packed)
         upload_name = _timestamped_upload_name(cwl_path)
         file_id = await _upload_packed_cwl(client, packed, upload_name)
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
-        return {
+        result = {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            "inputs_recorded": len(inputs) if inputs is not None else None,
+            "outputs_recorded": len(outputs) if outputs is not None else None,
         }
+        if io_warning:
+            result["io_warning"] = io_warning
+        return result
 
     # ------------------------------------------------------------------
     # Composite tools for remote MCP (no local filesystem) — caller has
@@ -655,6 +934,12 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         Deploys to ``AWSHealthOmics (us-east)`` — the server auto-
         registers on Omics via a Lambda and returns the ARN.
+
+        The input/output schema needs nothing from the caller: the
+        server downloads the uploaded file and reads the parameters off
+        it, exactly as the local composite reads them off the bytes it
+        packed. Do not ask the user to transcribe their workflow's
+        parameters.
 
         If the caller does NOT yet have a file_id, guide the user
         through these steps first (in a UI or chat, before calling
@@ -706,21 +991,33 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             version_num: WorkflowVersion number (always 1 for a new workflow)
             file_id: echo of the argument
             omics_arn: Full Omics workflow ARN
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if the schema could not be read
+            io_warning: present only when the schema could not be read —
+                registration still succeeded. Relay it to the user.
         """
         attributes = _git_attributes_from_args(git_commit, git_repo, git_ref)
+        inputs, outputs, io_warning = await _io_for_definition_uri(
+            client, f"ngs360://{file_id}",
+        )
 
         wf_resp = await client.post("/workflows", json={"name": name})
         workflow_id = str(wf_resp["id"])
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
-        return {
+        result = {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            "inputs_recorded": len(inputs) if inputs is not None else None,
+            "outputs_recorded": len(outputs) if outputs is not None else None,
         }
+        if io_warning:
+            result["io_warning"] = io_warning
+        return result
 
     @mcp.tool()
     async def update_workflow_from_file_id(
@@ -736,7 +1033,8 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         Runs create-version → deploy against the given ``file_id`` and
         ``workflow_id``. Preflight-checks that the workflow exists
-        before doing any work.
+        before doing any work. The input/output schema is read from the
+        uploaded file by the server — nothing for the caller to supply.
 
         If the caller does NOT yet have a file_id, walk the user
         through the pack + upload steps documented on
@@ -755,16 +1053,28 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             version_num: new WorkflowVersion number
             file_id: echo of the argument
             omics_arn: Full Omics workflow ARN for this new version
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if the schema could not be read
+            io_warning: present only when the schema could not be read —
+                the new version was still created. Relay it to the user.
         """
         await _check_workflow_exists(client, workflow_id)
         attributes = _git_attributes_from_args(git_commit, git_repo, git_ref)
+        inputs, outputs, io_warning = await _io_for_definition_uri(
+            client, f"ngs360://{file_id}",
+        )
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
-        return {
+        result = {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            "inputs_recorded": len(inputs) if inputs is not None else None,
+            "outputs_recorded": len(outputs) if outputs is not None else None,
         }
+        if io_warning:
+            result["io_warning"] = io_warning
+        return result
