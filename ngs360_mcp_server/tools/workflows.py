@@ -1,5 +1,6 @@
 """MCP tools for the Workflows API."""
 
+import functools
 import json
 import os
 import shutil
@@ -19,6 +20,57 @@ from ngs360_mcp_server.client import NGS360Client
 _OMICS_ENGINE = "AWSHealthOmics (us-east)"
 _UPLOAD_PROJECT_ID = "P-00000000-0001"
 _UPLOAD_RELATIVE_PATH = "workflow_definition_file"
+
+
+def _describe_http_error(exc: httpx.HTTPStatusError) -> str:
+    """Describe an API error including the API's own explanation.
+
+    httpx's message carries only the status and URL, so without this a
+    tool error reaches the model as "404 Not Found for url ..." with the
+    reason (which file, which field) thrown away. FastAPI puts that
+    reason in ``detail``: a string, or for a 422 a list of
+    ``{loc, msg}`` entries.
+    """
+    resp = exc.response
+    try:
+        body = resp.json()
+        detail = body.get("detail", body)
+    except (ValueError, AttributeError):
+        detail = resp.text.strip()[:500]
+    if isinstance(detail, list):
+        detail = "; ".join(
+            ": ".join(filter(None, [".".join(str(p) for p in e.get("loc", [])),
+                                    str(e.get("msg"))]))
+            if isinstance(e, dict) else str(e)
+            for e in detail
+        )
+    # Host and path only: a presigned S3 URL's query string is a bearer
+    # credential and must not end up in an error shown to the model.
+    url = resp.request.url
+    message = (
+        f"{resp.status_code} {resp.reason_phrase} from "
+        f"{resp.request.method} {url.host}{url.path}"
+    )
+    return f"{message}: {detail}" if detail else message
+
+
+def _surface_api_errors(fn):
+    """Re-raise API errors from a tool with the API's reason attached.
+
+    Still raises ``httpx.HTTPStatusError``, so the error type the MCP
+    layer reports is unchanged — only the message gains the detail.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except httpx.HTTPStatusError as exc:
+            raise httpx.HTTPStatusError(
+                _describe_http_error(exc),
+                request=exc.request,
+                response=exc.response,
+            ) from None
+    return wrapper
 
 
 def _require_stdio_transport(tool_name: str, sibling: str) -> None:
@@ -75,8 +127,10 @@ def _pack_cwl(src: str) -> bytes:
             "cwltool is not on PATH — install it (pip install cwltool) "
             "before calling register_workflow / update_workflow."
         )
+    # --disable-color: the stderr ends up in an error message for the
+    # model, where ANSI colour codes are just noise.
     proc = subprocess.run(
-        ["cwltool", "--quiet", "--pack", src],
+        ["cwltool", "--quiet", "--disable-color", "--pack", src],
         capture_output=True,
         check=False,
     )
@@ -320,7 +374,18 @@ async def _definition_bytes(
     """
     if definition_uri.startswith(_NGS360_URI_SCHEME):
         file_id = definition_uri[len(_NGS360_URI_SCHEME):].strip("/")
-        record = await client.get(f"/files/{file_id}")
+        try:
+            record = await client.get(f"/files/{file_id}")
+        except httpx.HTTPStatusError as exc:
+            # 404: no such file; 422: not a UUID. Raised as ValueError,
+            # which _io_for_definition_uri deliberately lets through.
+            if exc.response.status_code in (404, 422):
+                raise ValueError(
+                    f"file_id '{file_id}' does not exist on NGS360, so "
+                    f"nothing was created ({_describe_http_error(exc)}). "
+                    "Check the id returned by the upload."
+                ) from exc
+            raise
         if not isinstance(record, dict) or not record.get("uri"):
             raise RuntimeError(
                 f"file {file_id} has no 'uri' to download: {record}"
@@ -348,13 +413,23 @@ async def _io_for_definition_uri(
     list, the server downloads the very bytes it is about to register
     and reads the schema off them. That also makes the recorded schema
     provably the one belonging to the stored definition.
+
+    A file_id that does not exist is the one failure that is raised
+    rather than warned about. The API resolves ``ngs360://`` only at
+    deploy time, so a mistyped id would otherwise get a workflow and
+    version created before the deploy step fails, leaving both pointing
+    at nothing. Every caller runs this before creating anything.
     """
     try:
         raw = await _definition_bytes(client, definition_uri)
     except (httpx.HTTPError, RuntimeError, KeyError) as exc:
+        reason = (
+            _describe_http_error(exc)
+            if isinstance(exc, httpx.HTTPStatusError) else str(exc)
+        )
         return None, None, (
             "inputs/outputs were not recorded: could not download "
-            f"{definition_uri} to read its schema ({exc}). The version "
+            f"{definition_uri} to read its schema ({reason}). The version "
             "was still created; re-record the schema later if needed."
         )
     return _io_from_packed_bytes(raw)
@@ -393,6 +468,69 @@ async def _resolve_latest_version(
     return max(int(v["version"]) for v in versions)
 
 
+def _partial_failure_error(
+    progress: dict[str, Any], exc: Exception,
+) -> RuntimeError | None:
+    """Explain a composite that failed after it had already created things.
+
+    The chain is not transactional: the upload, the workflow row and the
+    version row each persist the moment they are made, and nothing rolls
+    them back. Instead of leaving the caller to discover them, say what
+    exists and which call finishes the job reusing it — running the
+    composite again from scratch would upload and create it all twice.
+
+    Returns None when nothing was created yet, in which case the original
+    error already tells the whole story.
+    """
+    created_any = (
+        progress.get("uploaded")
+        or progress.get("created_workflow")
+        or "version_num" in progress
+    )
+    if not created_any:
+        return None
+
+    file_id = progress["file_id"]
+    workflow_id = progress.get("workflow_id")
+    version_num = progress.get("version_num")
+
+    done = []
+    if progress.get("uploaded"):
+        done.append(f"uploaded the packed CWL as file {file_id}")
+    if progress.get("created_workflow"):
+        done.append(f"created workflow {workflow_id}")
+    if version_num is not None:
+        done.append(f"created version {version_num} of workflow {workflow_id}")
+
+    if version_num is not None:
+        step = "deploying to Omics"
+        finish = (
+            f"create_workflow_deployment(workflow_id='{workflow_id}', "
+            f"version_num={version_num}, engine='{_OMICS_ENGINE}'). If the "
+            "error was a timeout the workflow may already be registered on "
+            "Omics; in that case pass its ARN as external_id instead"
+        )
+    elif workflow_id:
+        step = "creating the version"
+        finish = (
+            f"update_workflow_from_file_id(file_id='{file_id}', "
+            f"workflow_id='{workflow_id}')"
+        )
+    else:
+        step = "creating the workflow"
+        finish = f"register_workflow_from_file_id(file_id='{file_id}', name=...)"
+
+    reason = (
+        _describe_http_error(exc)
+        if isinstance(exc, httpx.HTTPStatusError) else str(exc)
+    )
+    return RuntimeError(
+        f"Failed while {step}: {reason}. Already done, and not rolled "
+        f"back: {'; '.join(done)}. Once the cause is fixed, finish with "
+        f"{finish} rather than starting over."
+    )
+
+
 async def _create_version_and_deploy(
     client: NGS360Client,
     workflow_id: str,
@@ -400,6 +538,7 @@ async def _create_version_and_deploy(
     attributes: list[dict[str, str]],
     inputs: list[dict] | None = None,
     outputs: list[dict] | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> tuple[int, str]:
     """Create a new WorkflowVersion pointing at ``file_id`` and deploy it
     to Omics via the auto-register path. Returns (version_num, arn).
@@ -413,6 +552,9 @@ async def _create_version_and_deploy(
     dropped: a workflow genuinely declaring no outputs is a fact worth
     recording, and distinguishable from "never captured" (null) only if
     the empty list survives.
+
+    ``progress`` gets ``version_num`` once the version exists, so a
+    failed deploy can be reported by _partial_failure_error.
     """
     version_body: dict[str, Any] = {"definition_uri": f"ngs360://{file_id}"}
     if attributes:
@@ -425,6 +567,8 @@ async def _create_version_and_deploy(
         f"/workflows/{workflow_id}/versions", json=version_body,
     )
     version_num = int(version_resp["version"])
+    if progress is not None:
+        progress["version_num"] = version_num
 
     # No external_id → server invokes the Omics register lambda and
     # returns the ARN. See create_workflow_deployment above.
@@ -439,6 +583,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
     """Register all workflow-related tools with the MCP server."""
 
     @mcp.tool()
+    @_surface_api_errors
     async def list_workflows(
         page: int = 1,
         per_page: int = 20,
@@ -462,6 +607,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return await client.get("/workflows", params=params)
 
     @mcp.tool()
+    @_surface_api_errors
     async def get_workflow(workflow_id: str) -> dict:
         """Get details of a specific workflow.
 
@@ -471,6 +617,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return await client.get(f"/workflows/{workflow_id}")
 
     @mcp.tool()
+    @_surface_api_errors
     async def create_workflow(
         name: str,
         attributes: list[dict[str, str]] | None = None,
@@ -494,6 +641,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return await client.post("/workflows", json=body)
 
     @mcp.tool()
+    @_surface_api_errors
     async def create_workflow_version(
         workflow_id: str,
         definition_uri: str,
@@ -563,6 +711,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return resp
 
     @mcp.tool()
+    @_surface_api_errors
     async def list_workflow_versions(workflow_id: str) -> list:
         """List all versions of a workflow.
 
@@ -572,6 +721,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return await client.get(f"/workflows/{workflow_id}/versions")
 
     @mcp.tool()
+    @_surface_api_errors
     async def get_workflow_version(
         workflow_id: str, version_num: int
     ) -> dict:
@@ -587,6 +737,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         )
 
     @mcp.tool()
+    @_surface_api_errors
     async def set_workflow_alias(
         workflow_id: str,
         alias: str,
@@ -628,6 +779,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         )
 
     @mcp.tool()
+    @_surface_api_errors
     async def list_workflow_aliases(
         workflow_id: str, alias: str | None = None
     ) -> list:
@@ -645,6 +797,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         )
 
     @mcp.tool()
+    @_surface_api_errors
     async def delete_workflow_alias(workflow_id: str, alias: str) -> None:
         """Remove an alias from a workflow.
 
@@ -655,6 +808,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         await client.delete(f"/workflows/{workflow_id}/aliases/{alias}")
 
     @mcp.tool()
+    @_surface_api_errors
     async def create_workflow_deployment(
         workflow_id: str,
         version_num: int,
@@ -705,6 +859,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         )
 
     @mcp.tool()
+    @_surface_api_errors
     async def list_workflow_deployments(
         workflow_id: str,
         version_num: int | None = None,
@@ -738,6 +893,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         )
 
     @mcp.tool()
+    @_surface_api_errors
     async def delete_workflow_deployment(
         workflow_id: str, version_num: int, deployment_id: str
     ) -> None:
@@ -759,6 +915,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @_surface_api_errors
     async def register_workflow(
         cwl_path: str,
         name: str,
@@ -768,9 +925,10 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         Runs the pack → upload → create-workflow → create-version →
         deploy chain that register_ngs360_workflow.sh does from the CLI.
         On mid-chain failure earlier steps' resources (uploaded file,
-        created workflow row) remain in NGS360; recover by continuing
-        manually or by calling update_workflow with the returned
-        workflow_id from a partial run.
+        created workflow row, version) remain in NGS360. The error then
+        lists what was created and names the call that finishes the job
+        reusing it; follow that rather than re-running this tool, which
+        would upload and create everything again.
 
         Git provenance (git_commit, git_repo, git_ref) is captured from
         the CWL's containing directory and attached to the version as
@@ -823,14 +981,23 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         attributes = _git_attributes_for_path(cwl_path)
         inputs, outputs, io_warning = _io_from_packed_bytes(packed)
         upload_name = _timestamped_upload_name(cwl_path)
-        file_id = await _upload_packed_cwl(client, packed, upload_name)
+        progress: dict[str, Any] = {}
+        try:
+            file_id = await _upload_packed_cwl(client, packed, upload_name)
+            progress.update(file_id=file_id, uploaded=True)
 
-        wf_resp = await client.post("/workflows", json={"name": name})
-        workflow_id = str(wf_resp["id"])
+            wf_resp = await client.post("/workflows", json={"name": name})
+            workflow_id = str(wf_resp["id"])
+            progress.update(workflow_id=workflow_id, created_workflow=True)
 
-        version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes, inputs, outputs,
-        )
+            version_num, omics_arn = await _create_version_and_deploy(
+                client, workflow_id, file_id, attributes, inputs, outputs,
+                progress,
+            )
+        except Exception as exc:
+            if err := _partial_failure_error(progress, exc):
+                raise err from exc
+            raise
         result = {
             "workflow_id": workflow_id,
             "version_num": version_num,
@@ -844,6 +1011,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return result
 
     @mcp.tool()
+    @_surface_api_errors
     async def update_workflow(
         cwl_path: str,
         workflow_id: str,
@@ -891,11 +1059,19 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         attributes = _git_attributes_for_path(cwl_path)
         inputs, outputs, io_warning = _io_from_packed_bytes(packed)
         upload_name = _timestamped_upload_name(cwl_path)
-        file_id = await _upload_packed_cwl(client, packed, upload_name)
+        progress: dict[str, Any] = {"workflow_id": workflow_id}
+        try:
+            file_id = await _upload_packed_cwl(client, packed, upload_name)
+            progress.update(file_id=file_id, uploaded=True)
 
-        version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes, inputs, outputs,
-        )
+            version_num, omics_arn = await _create_version_and_deploy(
+                client, workflow_id, file_id, attributes, inputs, outputs,
+                progress,
+            )
+        except Exception as exc:
+            if err := _partial_failure_error(progress, exc):
+                raise err from exc
+            raise
         result = {
             "workflow_id": workflow_id,
             "version_num": version_num,
@@ -914,6 +1090,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @_surface_api_errors
     async def register_workflow_from_file_id(
         file_id: str,
         name: str,
@@ -1001,12 +1178,20 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             client, f"ngs360://{file_id}",
         )
 
-        wf_resp = await client.post("/workflows", json={"name": name})
-        workflow_id = str(wf_resp["id"])
+        progress: dict[str, Any] = {"file_id": file_id}
+        try:
+            wf_resp = await client.post("/workflows", json={"name": name})
+            workflow_id = str(wf_resp["id"])
+            progress.update(workflow_id=workflow_id, created_workflow=True)
 
-        version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes, inputs, outputs,
-        )
+            version_num, omics_arn = await _create_version_and_deploy(
+                client, workflow_id, file_id, attributes, inputs, outputs,
+                progress,
+            )
+        except Exception as exc:
+            if err := _partial_failure_error(progress, exc):
+                raise err from exc
+            raise
         result = {
             "workflow_id": workflow_id,
             "version_num": version_num,
@@ -1020,6 +1205,7 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return result
 
     @mcp.tool()
+    @_surface_api_errors
     async def update_workflow_from_file_id(
         file_id: str,
         workflow_id: str,
@@ -1064,9 +1250,16 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             client, f"ngs360://{file_id}",
         )
 
-        version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes, inputs, outputs,
-        )
+        progress: dict[str, Any] = {"file_id": file_id, "workflow_id": workflow_id}
+        try:
+            version_num, omics_arn = await _create_version_and_deploy(
+                client, workflow_id, file_id, attributes, inputs, outputs,
+                progress,
+            )
+        except Exception as exc:
+            if err := _partial_failure_error(progress, exc):
+                raise err from exc
+            raise
         result = {
             "workflow_id": workflow_id,
             "version_num": version_num,

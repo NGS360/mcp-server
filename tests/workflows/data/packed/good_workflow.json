@@ -1,0 +1,116 @@
+{
+    "$graph": [
+        {
+            "class": "Workflow",
+            "label": "Example workflow for registration tests",
+            "inputs": [
+                {
+                    "type": [
+                        "null",
+                        {
+                            "type": "array",
+                            "items": [
+                                "float",
+                                "string"
+                            ]
+                        }
+                    ],
+                    "doc": "Per-caller contamination estimates",
+                    "id": "#main/contamination_values"
+                },
+                {
+                    "type": "int",
+                    "default": 20,
+                    "doc": "Minimum base quality",
+                    "id": "#main/min_quality"
+                },
+                {
+                    "type": {
+                        "type": "array",
+                        "items": "File"
+                    },
+                    "doc": "Input reads, one file per lane",
+                    "id": "#main/reads"
+                },
+                {
+                    "type": [
+                        "null",
+                        "File"
+                    ],
+                    "doc": "Optional reference genome",
+                    "id": "#main/reference"
+                },
+                {
+                    "type": "string",
+                    "label": "Sample ID",
+                    "id": "#main/sample_id"
+                }
+            ],
+            "steps": [
+                {
+                    "run": "#count_lines.cwl",
+                    "in": [
+                        {
+                            "source": "#main/reads",
+                            "id": "#main/count/files"
+                        },
+                        {
+                            "source": "#main/min_quality",
+                            "id": "#main/count/min_quality"
+                        }
+                    ],
+                    "out": [
+                        "#main/count/counts"
+                    ],
+                    "id": "#main/count"
+                }
+            ],
+            "id": "#main",
+            "outputs": [
+                {
+                    "type": "File",
+                    "outputSource": "#main/count/counts",
+                    "doc": "Line counts for all reads",
+                    "id": "#main/line_counts"
+                }
+            ]
+        },
+        {
+            "class": "CommandLineTool",
+            "baseCommand": [
+                "wc",
+                "-l"
+            ],
+            "inputs": [
+                {
+                    "type": {
+                        "type": "array",
+                        "items": "File"
+                    },
+                    "doc": "Step-level input; must not appear in the workflow's schema",
+                    "inputBinding": {
+                        "position": 1
+                    },
+                    "id": "#count_lines.cwl/files"
+                },
+                {
+                    "type": "int",
+                    "default": 20,
+                    "id": "#count_lines.cwl/min_quality"
+                }
+            ],
+            "outputs": [
+                {
+                    "type": "File",
+                    "id": "#count_lines.cwl/counts",
+                    "outputBinding": {
+                        "glob": "a18fa187faf568b14b6b903f3db8074763f9bc5e"
+                    }
+                }
+            ],
+            "id": "#count_lines.cwl",
+            "stdout": "a18fa187faf568b14b6b903f3db8074763f9bc5e"
+        }
+    ],
+    "cwlVersion": "v1.2"
+}

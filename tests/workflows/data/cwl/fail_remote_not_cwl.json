@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "REMOTE PATH ONLY. Upload and register by file id.",
+    "",
+    "Valid JSON that is not a CWL process -- the shape you get when",
+    "someone uploads an inputs job-order file, a config, or an API",
+    "response by mistake. It has no '$graph' and no 'inputs'/'outputs'.",
+    "",
+    "Expected:",
+    "  the workflow IS registered",
+    "  io_warning: \"document has neither '$graph' nor 'inputs'/'outputs';",
+    "               it does not look like a CWL process\"",
+    "  DB: inputs and outputs are both NULL",
+    "",
+    "This case is why the parser requires a parameter section to be",
+    "present. Without that check it would read 'no inputs found' off any",
+    "JSON object and record [] -- making a mis-uploaded config",
+    "indistinguishable from a parameterless workflow."
+  ],
+  "sample_id": "NA12878",
+  "reference_build": "GRCh38",
+  "threads": 8,
+  "regions": ["chr1", "chr2", "chrX"]
+}

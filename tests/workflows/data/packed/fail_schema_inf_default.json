@@ -1,0 +1,17 @@
+{
+    "class": "CommandLineTool",
+    "baseCommand": [
+        "echo"
+    ],
+    "inputs": [
+        {
+            "type": "float",
+            "default": Infinity,
+            "doc": "Upper coverage bound; .inf means no limit.",
+            "id": "#main/max_coverage"
+        }
+    ],
+    "id": "#main",
+    "outputs": [],
+    "cwlVersion": "v1.2"
+}
