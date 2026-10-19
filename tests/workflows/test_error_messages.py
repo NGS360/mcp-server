@@ -40,6 +40,11 @@ class TestDescribeHttpError:
         exc = _error(422, json={"detail": [{"msg": "Input should be a valid UUID"}]})
         assert _describe_http_error(exc).endswith(": Input should be a valid UUID")
 
+    def test_validation_entry_with_null_fields_does_not_crash(self):
+        # A crash here would replace the API's error with a TypeError.
+        exc = _error(422, json={"detail": [{"loc": None, "msg": "bad"}, {"loc": ["x"]}]})
+        assert _describe_http_error(exc).endswith(": bad; x")
+
     def test_non_json_body(self):
         exc = _error(502, text="<html>Bad Gateway</html>")
         assert _describe_http_error(exc).endswith(": <html>Bad Gateway</html>")

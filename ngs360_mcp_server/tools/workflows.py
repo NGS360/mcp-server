@@ -39,8 +39,10 @@ def _describe_http_error(exc: httpx.HTTPStatusError) -> str:
         detail = resp.text.strip()[:500]
     if isinstance(detail, list):
         detail = "; ".join(
-            ": ".join(filter(None, [".".join(str(p) for p in e.get("loc", [])),
-                                    str(e.get("msg"))]))
+            # `or`: tolerate null loc/msg from anything that isn't FastAPI
+            # (a proxy, say) — a crash here would replace the real error.
+            ": ".join(filter(None, [".".join(str(p) for p in e.get("loc") or []),
+                                    str(e.get("msg") or "")]))
             if isinstance(e, dict) else str(e)
             for e in detail
         )
@@ -673,11 +675,12 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             workflow_id: The workflow UUID
             definition_uri: URI to the workflow definition file —
                 ``ngs360://<file_id>`` or ``s3://...``
-            inputs: Optional explicit input schema, which skips the
-                download-and-parse. Each entry is
+            inputs: Optional explicit input schema. Each entry is
                 ``{"id", "type", "required", "doc"?, "default"?}``.
-                Supply this only to correct or supplement what the CWL
-                declares; normally leave it unset.
+                Supplying either ``inputs`` or ``outputs`` replaces the
+                parsed schema entirely: the definition is not read, and
+                whichever of the two is omitted is recorded as null
+                (not captured). Normally leave both unset.
             outputs: Optional explicit output schema. Each entry is
                 ``{"id", "type", "doc"?}``.
             capture_io: Set False to create the version with no schema
