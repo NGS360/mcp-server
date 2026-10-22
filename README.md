@@ -117,7 +117,20 @@ mcp-server/
         ├── settings.py    # Settings tools
         ├── platforms.py   # Platform registry tools
         ├── manifest.py    # Manifest tools
+└── tests/
+    └── workflows/         # Workflow tool tests, against an in-memory fake API
 ```
+
+### Running the tests
+
+```bash
+pip install -e ".[test]"
+python -m pytest
+```
+
+No NGS360 server or network access is needed: requests go to an in-memory
+stand-in for the API and S3. Tests that pack a local CWL need `cwltool` on
+`PATH` (`pip install cwltool`) and are skipped without it.
 
 ### Testing with MCP Inspector
 
