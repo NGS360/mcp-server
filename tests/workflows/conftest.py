@@ -1,6 +1,6 @@
 """Fixtures for the workflow-tool tests.
 
-``fake``    the in-memory NGS360 API + S3 every request is routed to
+``fake``    the in-memory NGS360 API every request is routed to
 ``tools``   the workflow tools as plain async functions, for asserting
             on results and on the exceptions they raise
 ``mcp_call``  invoke a tool through a real in-memory MCP client session,
@@ -21,7 +21,6 @@ from .fake_ngs360 import API_URL, TOKEN, FakeNGS360
 
 DATA = Path(__file__).parent / "data"
 CWL = DATA / "cwl"
-PACKED = DATA / "packed"
 
 requires_cwltool = pytest.mark.skipif(
     shutil.which("cwltool") is None,
@@ -42,8 +41,7 @@ def _stdio_transport(monkeypatch):
 
 @pytest.fixture
 def fake(monkeypatch) -> FakeNGS360:
-    """Route every httpx.AsyncClient — the API client and the S3 fetch — to
-    one FakeNGS360."""
+    """Route every httpx.AsyncClient to one FakeNGS360."""
     fake = FakeNGS360()
     real = httpx.AsyncClient
 
@@ -130,38 +128,23 @@ def git_repo(tmp_path) -> Path:
     return repo
 
 
-# Hand-checked against tests/workflows/data/cwl/*.cwl. cwltool --pack
-# sorts parameters by id, which is why the order differs from the source.
+# What a model reading good_tool.cwl would pass, following the tools'
+# schema guide. The server records these as given.
 GOOD_TOOL_INPUTS = [
-    {"id": "mode", "type": "enum(fast|safe)", "required": False,
-     "doc": "Copy strategy", "default": "safe"},
     {"id": "source_file", "type": "File", "required": True,
-     "doc": "Source file to copy"},                       # from `label`
+     "doc": "Source file to copy"},
     {"id": "target_filename", "type": "string", "required": True,
      "doc": "Name for the output file"},
     {"id": "verbose", "type": "boolean?", "required": False,
      "doc": "Print each file as it is copied"},
+    {"id": "mode", "type": "enum(fast|safe)", "required": False,
+     "doc": "Copy strategy", "default": "safe"},
 ]
 GOOD_TOOL_OUTPUTS = [{"id": "copied_file", "type": "File", "doc": "The copy"}]
 
-GOOD_WORKFLOW_INPUTS = [
-    {"id": "contamination_values", "type": "(float|string)[]?", "required": False,
-     "doc": "Per-caller contamination estimates"},
-    {"id": "min_quality", "type": "int", "required": False,
-     "doc": "Minimum base quality", "default": 20},
-    {"id": "reads", "type": "File[]", "required": True,
-     "doc": "Input reads, one file per lane"},
-    {"id": "reference", "type": "File?", "required": False,
-     "doc": "Optional reference genome"},
-    {"id": "sample_id", "type": "string", "required": True,
-     "doc": "Sample ID"},                                  # from `label`
-]
-GOOD_WORKFLOW_OUTPUTS = [{"id": "line_counts", "type": "File",
-                          "doc": "Line counts for all reads"}]
-
 
 def stored(entries: list[dict], *, output: bool = False) -> list[dict]:
-    """What the API stores for parsed entries: model_dump() keeps absent
-    optional fields as null."""
+    """What the API stores for the given entries: model_dump() keeps
+    absent optional fields as null."""
     keys = ("id", "doc", "type") if output else ("id", "doc", "type", "default", "required")
     return [{k: e.get(k) for k in keys} for e in entries]

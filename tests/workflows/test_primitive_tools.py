@@ -6,12 +6,10 @@ import json
 import httpx
 import pytest
 
-from .conftest import GOOD_WORKFLOW_INPUTS, GOOD_WORKFLOW_OUTPUTS, PACKED, stored
+from .conftest import GOOD_TOOL_INPUTS, GOOD_TOOL_OUTPUTS, stored
 from .fake_ngs360 import OMICS_ENGINE
 
 pytestmark = pytest.mark.anyio
-
-MISSING_FILE = "11111111-2222-3333-4444-555555555555"
 
 
 # --- workflows ---------------------------------------------------------------
@@ -55,78 +53,55 @@ async def test_create_workflow_omits_empty_attributes(tools, fake):
 
 # --- versions ----------------------------------------------------------------
 
-@pytest.fixture
-def workflow_and_file(fake):
-    file_id = fake.add_file((PACKED / "good_workflow.json").read_bytes())
-    return fake.add_workflow(), file_id
-
-
-async def test_create_version_reads_schema_from_ngs360_uri(tools, fake, workflow_and_file):
-    workflow_id, file_id = workflow_and_file
-    result = await tools.create_workflow_version(workflow_id, f"ngs360://{file_id}")
-    assert "io_warning" not in result
+async def test_create_version_records_the_given_schema(tools, fake):
+    workflow_id = fake.add_workflow(versions=0)
+    await tools.create_workflow_version(workflow_id, "ngs360://f1",
+                                        inputs=GOOD_TOOL_INPUTS,
+                                        outputs=GOOD_TOOL_OUTPUTS)
     version = fake.latest_version(workflow_id)
-    assert version["inputs"] == stored(GOOD_WORKFLOW_INPUTS)
-    assert version["outputs"] == stored(GOOD_WORKFLOW_OUTPUTS, output=True)
+    assert version["inputs"] == stored(GOOD_TOOL_INPUTS)
+    assert version["outputs"] == stored(GOOD_TOOL_OUTPUTS, output=True)
     assert fake.deployments == [], "the primitive must not deploy"
 
 
-async def test_create_version_s3_uri_skips_file_lookup(tools, fake, workflow_and_file):
-    workflow_id, file_id = workflow_and_file
-    uri = fake.files[file_id]["uri"]
-    await tools.create_workflow_version(workflow_id, uri)
-    assert fake.latest_version(workflow_id)["inputs"] == stored(GOOD_WORKFLOW_INPUTS)
-    assert ("GET", f"/files/{file_id}") not in fake.calls()
-    assert ("GET", "/files/download-url") in fake.calls()
+async def test_create_version_never_reads_the_definition(tools, fake):
+    workflow_id = fake.add_workflow(versions=0)
+    await tools.create_workflow_version(workflow_id, "ngs360://f1", inputs=GOOD_TOOL_INPUTS)
+    assert fake.calls() == [("POST", f"/workflows/{workflow_id}/versions")]
 
 
-async def test_create_version_explicit_schema_skips_download(tools, fake, workflow_and_file):
-    workflow_id, file_id = workflow_and_file
-    inputs = [{"id": "x", "type": "File", "required": True}]
-    await tools.create_workflow_version(workflow_id, f"ngs360://{file_id}", inputs=inputs)
-    version = fake.latest_version(workflow_id)
-    assert version["inputs"] == [{"id": "x", "type": "File", "required": True,
-                                  "doc": None, "default": None}]
-    assert version["outputs"] is None, "only what the caller gave is recorded"
-    assert not any("/files" in path for _, path in fake.calls())
-
-
-async def test_create_version_capture_io_false(tools, fake, workflow_and_file):
-    workflow_id, file_id = workflow_and_file
-    await tools.create_workflow_version(workflow_id, f"ngs360://{file_id}", capture_io=False)
+async def test_create_version_without_schema_leaves_it_null(tools, fake):
+    workflow_id = fake.add_workflow(versions=0)
+    await tools.create_workflow_version(workflow_id, "s3://bucket/x.cwl")
+    assert json.loads(fake.requests[-1].content) == {"definition_uri": "s3://bucket/x.cwl"}
     version = fake.latest_version(workflow_id)
     assert version["inputs"] is None and version["outputs"] is None
-    assert not any("/files" in path for _, path in fake.calls())
 
 
-async def test_create_version_malformed_explicit_schema_names_the_field(
-        tools, fake, workflow_and_file):
-    workflow_id, file_id = workflow_and_file
+async def test_create_version_sends_empty_lists_as_empty(tools, fake):
+    # [] means "declares no parameters", which is not the same as null.
+    workflow_id = fake.add_workflow(versions=0)
+    await tools.create_workflow_version(workflow_id, "ngs360://f1", inputs=[], outputs=[])
+    version = fake.latest_version(workflow_id)
+    assert version["inputs"] == [] and version["outputs"] == []
+
+
+async def test_create_version_one_side_only(tools, fake):
+    workflow_id = fake.add_workflow(versions=0)
+    await tools.create_workflow_version(workflow_id, "ngs360://f1", outputs=GOOD_TOOL_OUTPUTS)
+    version = fake.latest_version(workflow_id)
+    assert version["inputs"] is None
+    assert version["outputs"] == stored(GOOD_TOOL_OUTPUTS, output=True)
+
+
+async def test_create_version_malformed_schema_names_the_field(tools, fake):
+    # Called directly, the typed arguments aren't enforced, so this is the
+    # API's own validation (see test_mcp_interface for the MCP-level check).
+    workflow_id = fake.add_workflow(versions=0)
     with pytest.raises(httpx.HTTPStatusError, match=r"422 .*inputs\.0\.required: Field required"):
         await tools.create_workflow_version(
-            workflow_id, f"ngs360://{file_id}", inputs=[{"id": "x", "type": "File"}])
-
-
-async def test_create_version_unknown_file_creates_nothing(tools, fake, workflow_and_file):
-    workflow_id, _ = workflow_and_file
-    with pytest.raises(ValueError, match="does not exist on NGS360, so nothing was created"):
-        await tools.create_workflow_version(workflow_id, f"ngs360://{MISSING_FILE}")
-    assert fake.writes() == []
-
-
-async def test_create_version_unreachable_definition_warns(tools, fake, workflow_and_file):
-    workflow_id, file_id = workflow_and_file
-    fake.fail("GET", "/files/download-url", 403)
-    result = await tools.create_workflow_version(workflow_id, f"ngs360://{file_id}")
-    assert "could not download" in result["io_warning"]
-    assert "injected 403" in result["io_warning"]
-    assert fake.latest_version(workflow_id)["inputs"] is None
-
-
-async def test_create_version_unsupported_scheme_warns(tools, fake, workflow_and_file):
-    workflow_id, _ = workflow_and_file
-    result = await tools.create_workflow_version(workflow_id, "https://example.com/x.cwl")
-    assert "expected 'ngs360://<file-id>' or 's3://'" in result["io_warning"]
+            workflow_id, "ngs360://f1", inputs=[{"id": "x", "type": "File"}])
+    assert fake.versions[workflow_id] == []
 
 
 async def test_list_and_get_versions(tools, fake):

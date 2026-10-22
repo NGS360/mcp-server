@@ -12,8 +12,6 @@ from .conftest import (
     CWL,
     GOOD_TOOL_INPUTS,
     GOOD_TOOL_OUTPUTS,
-    GOOD_WORKFLOW_INPUTS,
-    GOOD_WORKFLOW_OUTPUTS,
     requires_cwltool,
     stored,
 )
@@ -28,7 +26,9 @@ ANSI_ESCAPE = re.compile(r"\x1b\[")
 
 @requires_cwltool
 async def test_register_new_workflow_end_to_end(tools, fake, git_repo):
-    result = await tools.register_workflow(str(git_repo / "good_tool.cwl"), "Good tool")
+    result = await tools.register_workflow(
+        str(git_repo / "good_tool.cwl"), "Good tool",
+        inputs=GOOD_TOOL_INPUTS, outputs=GOOD_TOOL_OUTPUTS)
 
     workflow_id = result["workflow_id"]
     assert result == {
@@ -61,16 +61,8 @@ async def test_upload_form_and_packed_content(tools, fake, git_repo):
     assert re.fullmatch(r"good_tool\.\d{8}T\d{6}Z\.cwl", record["form"]["filename"])
     assert record["form"]["relative_path"] == "workflow_definition_file"
     assert record["form"]["project_id"] == "P-00000000-0001"
-    uploaded = json.loads(fake.s3["workflow_definition_file/" + record["filename"]])
+    uploaded = json.loads(fake.uploads[result["file_id"]])
     assert uploaded["id"] == "#main", "the packed CWL is what gets uploaded"
-
-
-@requires_cwltool
-async def test_multi_step_workflow_records_only_its_own_parameters(tools, fake):
-    result = await tools.register_workflow(str(CWL / "good_workflow.cwl"), "wf")
-    version = fake.latest_version(result["workflow_id"])
-    assert version["inputs"] == stored(GOOD_WORKFLOW_INPUTS)
-    assert version["outputs"] == stored(GOOD_WORKFLOW_OUTPUTS, output=True)
 
 
 @requires_cwltool
@@ -101,29 +93,32 @@ async def test_no_git_attributes_outside_a_checkout(tools, fake, tmp_path):
 @requires_cwltool
 async def test_update_adds_a_version(tools, fake, git_repo):
     workflow_id = fake.add_workflow(versions=2)
-    result = await tools.update_workflow(str(git_repo / "good_tool.cwl"), workflow_id)
+    result = await tools.update_workflow(
+        str(git_repo / "good_tool.cwl"), workflow_id,
+        inputs=GOOD_TOOL_INPUTS, outputs=GOOD_TOOL_OUTPUTS)
     assert result["version_num"] == 3
     assert result["inputs_recorded"] == 4
+    assert fake.latest_version(workflow_id)["inputs"] == stored(GOOD_TOOL_INPUTS)
     assert ("POST", "/workflows") not in fake.writes(), "must not create a workflow"
     assert len(fake.deployments) == 1
 
 
-# --- schema problems never block registration --------------------------------------
+# --- the schema is recorded as given ---------------------------------------------
 
 @requires_cwltool
-async def test_unreadable_schema_still_registers(tools, fake):
-    result = await tools.register_workflow(str(CWL / "fail_schema_inf_default.cwl"), "t")
+async def test_no_schema_given_leaves_it_null(tools, fake):
+    result = await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
     assert result["inputs_recorded"] is None and result["outputs_recorded"] is None
-    assert "Out of range float" in result["io_warning"]
     version = fake.latest_version(result["workflow_id"])
     assert version["inputs"] is None and version["outputs"] is None
     assert len(fake.deployments) == 1
 
 
 @requires_cwltool
-async def test_no_parameters_recorded_as_empty_lists(tools, fake):
-    result = await tools.register_workflow(str(CWL / "pass_no_parameters.cwl"), "t")
-    assert "io_warning" not in result
+async def test_empty_lists_are_recorded_as_empty(tools, fake):
+    result = await tools.register_workflow(str(CWL / "good_tool.cwl"), "t",
+                                           inputs=[], outputs=[])
+    assert (result["inputs_recorded"], result["outputs_recorded"]) == (0, 0)
     version = fake.latest_version(result["workflow_id"])
     assert version["inputs"] == [] and version["outputs"] == []
 

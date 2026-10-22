@@ -1,4 +1,4 @@
-"""In-memory stand-in for the NGS360 API and S3.
+"""In-memory stand-in for the NGS360 API.
 
 Served through ``httpx.MockTransport``, so tools run against the real
 NGS360Client and the real HTTP stack with no network. The routes follow
@@ -17,7 +17,6 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 API_URL = "https://api.test"
-S3_HOST = "s3.test"
 TOKEN = "test-token"
 OMICS_ENGINE = "AWSHealthOmics (us-east)"
 
@@ -73,14 +72,13 @@ def _detail(status: int, detail: Any) -> httpx.Response:
 class FakeNGS360:
     def __init__(self) -> None:
         self.files: dict[str, dict] = {}        # file id -> record
-        self.s3: dict[str, bytes] = {}          # object key -> bytes
+        self.uploads: dict[str, bytes] = {}     # file id -> uploaded bytes
         self.workflows: dict[str, dict] = {}    # workflow id -> record
         self.versions: dict[str, list[dict]] = {}
         self.aliases: dict[str, dict[str, int]] = {}
         self.deployments: list[dict] = []
         self.requests: list[httpx.Request] = []
         self._faults: list[tuple[str, str, httpx.Response]] = []
-        self.s3_saw_authorization = False
 
     # ---- test setup -------------------------------------------------------
     def add_file(self, content: bytes, filename: str = "seeded.packed.cwl") -> str:
@@ -88,7 +86,7 @@ class FakeNGS360:
         key = f"workflow_definition_file/{filename}"
         self.files[file_id] = {"id": file_id, "uri": f"s3://test-bucket/{key}",
                                "filename": filename}
-        self.s3[key] = content
+        self.uploads[file_id] = content
         return file_id
 
     def add_workflow(self, name: str = "existing", versions: int = 1) -> str:
@@ -104,8 +102,8 @@ class FakeNGS360:
              body: Any = None, *, text: str | None = None) -> None:
         """Make requests matching ``method`` and ``path_regex`` fail.
 
-        ``method`` "S3" targets the object store; the regex is matched
-        against the API path with its /api/v1 prefix removed.
+        The regex is matched against the API path with its /api/v1 prefix
+        removed.
         """
         if text is not None:
             resp = httpx.Response(status, text=text)
@@ -117,13 +115,12 @@ class FakeNGS360:
     def calls(self, method: str | None = None) -> list[tuple[str, str]]:
         out = []
         for r in self.requests:
-            m = "S3" if r.url.host == S3_HOST else r.method
-            if method is None or m == method:
-                out.append((m, r.url.path.removeprefix("/api/v1")))
+            if method is None or r.method == method:
+                out.append((r.method, r.url.path.removeprefix("/api/v1")))
         return out
 
     def writes(self) -> list[tuple[str, str]]:
-        return [c for c in self.calls() if c[0] not in ("GET", "S3")]
+        return [c for c in self.calls() if c[0] != "GET"]
 
     def latest_version(self, workflow_id: str | None = None) -> dict:
         workflow_id = workflow_id or next(reversed(self.workflows))
@@ -132,24 +129,11 @@ class FakeNGS360:
     # ---- transport --------------------------------------------------------
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        if request.url.host == S3_HOST:
-            return self._s3(request)
         path = request.url.path.removeprefix("/api/v1")
         for method, regex, resp in self._faults:
             if method == request.method and re.fullmatch(regex, path):
                 return resp
         return self._api(request, path)
-
-    def _s3(self, request: httpx.Request) -> httpx.Response:
-        if "authorization" in request.headers:
-            self.s3_saw_authorization = True
-        for method, regex, resp in self._faults:
-            if method == "S3" and re.search(regex, request.url.path):
-                return resp
-        key = request.url.path.lstrip("/")
-        if key not in self.s3:
-            return httpx.Response(404, text="<Error><Code>NoSuchKey</Code></Error>")
-        return httpx.Response(200, content=self.s3[key])
 
     def _new_version(self, workflow_id: str, body: dict) -> dict:
         versions = self.versions[workflow_id]
@@ -179,13 +163,6 @@ class FakeNGS360:
             self.files[file_id]["form"] = {k: v.decode() for k, v in fields.items()
                                            if k != "content"}
             return _json(201, self.files[file_id])
-
-        if method == "GET" and path == "/files/download-url":
-            if not authed:
-                return unauthorized
-            key = request.url.params["path"].split("/", 3)[3]
-            return _json(200, {"url": f"https://{S3_HOST}/{key}?X-Amz-Signature=secret",
-                               "expires_in": 3600})
 
         if method == "GET" and (m := re.fullmatch(r"/files/([^/]+)", path)):
             try:
