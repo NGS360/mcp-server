@@ -9,8 +9,6 @@ from .fake_ngs360 import OMICS_ENGINE
 
 pytestmark = pytest.mark.anyio
 
-MISSING_FILE = "11111111-2222-3333-4444-555555555555"
-
 
 @pytest.fixture
 def uploaded(fake):
@@ -37,11 +35,6 @@ async def test_register_records_the_given_schema(tools, fake, uploaded):
     assert version["outputs"] == stored(GOOD_TOOL_OUTPUTS, output=True)
     assert version["attributes"] is None
     assert fake.deployments[0]["engine"] == OMICS_ENGINE
-
-
-async def test_file_is_checked_before_anything_is_created(tools, fake, uploaded):
-    await tools.register_workflow_from_file_id(uploaded, "wf")
-    assert fake.calls()[:2] == [("GET", f"/files/{uploaded}"), ("POST", "/workflows")]
 
 
 async def test_no_schema_given_leaves_it_null(tools, fake, uploaded):
@@ -86,9 +79,9 @@ async def test_update_adds_a_version(tools, fake, uploaded):
 
 
 async def test_malformed_schema_is_rejected_by_the_api(tools, fake, uploaded):
-    # The version create fails after the workflow was made, so the error
-    # also says how to finish (see test_error_messages).
-    with pytest.raises(RuntimeError, match=r"422 .*inputs\.0\.required: Field required"):
+    # Reached only when the caller bypasses the typed arguments; through
+    # MCP a bad entry is rejected first (see test_mcp_interface).
+    with pytest.raises(httpx.HTTPStatusError, match="422 Unprocessable Entity"):
         await tools.register_workflow_from_file_id(
             uploaded, "wf", inputs=[{"id": "x", "type": "File"}])
     (workflow_id,) = fake.workflows
@@ -97,82 +90,50 @@ async def test_malformed_schema_is_rejected_by_the_api(tools, fake, uploaded):
 
 # --- refused before anything is created ------------------------------------------
 
-@pytest.mark.parametrize("file_id, reason", [
-    (MISSING_FILE, f"File {MISSING_FILE} not found"),
-    ("not-a-uuid", "path.file_id: Input should be a valid UUID"),
-])
-async def test_unknown_file_id_creates_nothing(tools, fake, file_id, reason):
-    with pytest.raises(ValueError) as info:
-        await tools.register_workflow_from_file_id(file_id, "wf")
-    msg = str(info.value)
-    assert f"file_id '{file_id}' does not exist on NGS360, so nothing was created" in msg
-    assert reason in msg
-    assert fake.writes() == []
-
-
-async def test_update_unknown_file_id_creates_nothing(tools, fake):
-    workflow_id = fake.add_workflow()
-    with pytest.raises(ValueError, match="does not exist on NGS360"):
-        await tools.update_workflow_from_file_id(MISSING_FILE, workflow_id)
-    assert fake.writes() == []
-
-
 async def test_update_unknown_workflow_is_checked_first(tools, fake, uploaded):
-    with pytest.raises(httpx.HTTPStatusError, match="404 .*: Workflow not found"):
+    with pytest.raises(httpx.HTTPStatusError, match="404 Not Found"):
         await tools.update_workflow_from_file_id(uploaded, "nope")
     assert fake.writes() == []
     assert not any(path.startswith("/files") for _, path in fake.calls())
 
 
-async def test_file_lookup_failing_otherwise_is_not_reported_as_missing(tools, fake, uploaded):
-    fake.fail("GET", f"/files/{uploaded}", 500)
-    with pytest.raises(httpx.HTTPStatusError, match="500 .*injected 500"):
-        await tools.register_workflow_from_file_id(uploaded, "wf")
-    assert fake.writes() == []
-
-
 async def test_expired_token(tools_with_token, fake, uploaded):
     tools = tools_with_token("expired")
-    with pytest.raises(httpx.HTTPStatusError, match="401 .*Could not validate credentials"):
+    with pytest.raises(httpx.HTTPStatusError, match="401 Unauthorized"):
         await tools.register_workflow_from_file_id(uploaded, "wf")
     assert fake.workflows == {}
 
 
-# --- failures part-way through -------------------------------------------------------
+# --- failures part-way through leave earlier steps in place -------------------------
 
 async def test_workflow_create_fails(tools, fake, uploaded):
-    # Nothing was created by this call, so the plain API error is reported.
     fake.fail("POST", "/workflows", 500)
-    with pytest.raises(httpx.HTTPStatusError, match="500 .*injected 500"):
+    with pytest.raises(httpx.HTTPStatusError, match="500 Internal Server Error"):
         await tools.register_workflow_from_file_id(uploaded, "wf")
+    assert fake.workflows == {}
 
 
 async def test_version_create_fails(tools, fake, uploaded):
     fake.fail("POST", "/workflows/[^/]+/versions", 500)
-    with pytest.raises(RuntimeError) as info:
+    with pytest.raises(httpx.HTTPStatusError, match="500 Internal Server Error"):
         await tools.register_workflow_from_file_id(uploaded, "wf")
     (workflow_id,) = fake.workflows
-    msg = str(info.value)
-    assert msg.startswith("Failed while creating the version: 500")
-    assert "uploaded" not in msg, "this call uploaded nothing"
-    assert (f"update_workflow_from_file_id(file_id='{uploaded}', "
-            f"workflow_id='{workflow_id}')") in msg
+    assert fake.versions[workflow_id] == [], "the workflow row is left behind"
 
 
-async def test_deploy_fails(tools, fake, uploaded):
+async def test_deploy_fails_but_the_version_survives(tools, fake, uploaded):
     fake.fail("POST", "/workflows/[^/]+/versions/\\d+/deployments", 502)
-    with pytest.raises(RuntimeError, match="Failed while deploying to Omics: 502") as info:
+    with pytest.raises(httpx.HTTPStatusError, match="502 Bad Gateway"):
         await tools.register_workflow_from_file_id(uploaded, "wf")
     (workflow_id,) = fake.workflows
-    assert f"create_workflow_deployment(workflow_id='{workflow_id}', version_num=1" \
-        in str(info.value)
+    assert len(fake.versions[workflow_id]) == 1
+    assert fake.deployments == []
 
 
 async def test_update_deploy_fails(tools, fake, uploaded):
     workflow_id = fake.add_workflow(versions=1)
     fake.fail("POST", "/workflows/[^/]+/versions/\\d+/deployments", 502)
-    with pytest.raises(RuntimeError) as info:
+    with pytest.raises(httpx.HTTPStatusError, match="502 Bad Gateway"):
         await tools.update_workflow_from_file_id(uploaded, workflow_id)
-    msg = str(info.value)
-    assert f"created version 2 of workflow {workflow_id}" in msg
-    assert "created workflow" not in msg
+    assert len(fake.versions[workflow_id]) == 2, "the new version survives"
+    assert fake.deployments == []

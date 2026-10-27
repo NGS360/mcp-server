@@ -165,21 +165,21 @@ async def test_cwltool_not_installed(tools, fake, monkeypatch, tmp_path, cwl_fil
 
 
 async def test_update_unknown_workflow_uploads_nothing(tools, fake, fake_cwltool, cwl_file):
-    with pytest.raises(httpx.HTTPStatusError, match="404 .*: Workflow not found"):
+    with pytest.raises(httpx.HTTPStatusError, match="404 Not Found"):
         await tools.update_workflow(str(cwl_file), "nope")
     assert fake.writes() == [] and fake.files == {}
 
 
 async def test_expired_token(tools_with_token, fake, fake_cwltool, cwl_file):
     tools = tools_with_token("expired")
-    with pytest.raises(httpx.HTTPStatusError, match="401 .*Could not validate credentials"):
+    with pytest.raises(httpx.HTTPStatusError, match="401 Unauthorized"):
         await tools.register_workflow(str(cwl_file), "t")
     assert fake.files == {} and fake.workflows == {}
 
 
 async def test_upload_fails(tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/files/upload", 500)
-    with pytest.raises(httpx.HTTPStatusError, match="500 .*injected 500"):
+    with pytest.raises(httpx.HTTPStatusError, match="500 Internal Server Error"):
         await tools.register_workflow(str(cwl_file), "t")
     assert fake.workflows == {}
 
@@ -191,59 +191,52 @@ async def test_upload_response_without_id(tools, fake, fake_cwltool, cwl_file):
     assert fake.workflows == {}
 
 
-# --- failures part-way through: say what exists and how to finish ---------------------
+# --- failures part-way through leave earlier steps in place -------------------------
+#
+# The chain is not transactional: nothing rolls back what already
+# succeeded. These pin that down, so a change to it is visible.
 
 async def test_workflow_create_fails_after_upload(tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/workflows", 500)
-    with pytest.raises(RuntimeError) as info:
+    with pytest.raises(httpx.HTTPStatusError, match="500 Internal Server Error"):
         await tools.register_workflow(str(cwl_file), "t")
-    (file_id,) = fake.files
-    msg = str(info.value)
-    assert msg.startswith("Failed while creating the workflow: 500")
-    assert f"uploaded the packed CWL as file {file_id}" in msg
-    assert f"register_workflow_from_file_id(file_id='{file_id}', name=...)" in msg
+    assert len(fake.files) == 1, "the uploaded file is not cleaned up"
+    assert fake.workflows == {}
 
 
 async def test_version_create_fails_after_workflow(tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/workflows/[^/]+/versions", 500)
-    with pytest.raises(RuntimeError) as info:
-        await tools.register_workflow(str(cwl_file), "t")
-    (file_id,), (workflow_id,) = fake.files, fake.workflows
-    msg = str(info.value)
-    assert msg.startswith("Failed while creating the version")
-    assert f"created workflow {workflow_id}" in msg
-    assert (f"update_workflow_from_file_id(file_id='{file_id}', "
-            f"workflow_id='{workflow_id}')") in msg
-
-
-async def test_deploy_fails_and_the_suggested_recovery_works(
-        tools, fake, fake_cwltool, cwl_file):
-    fake.fail("POST", "/workflows/[^/]+/versions/\\d+/deployments", 502)
-    with pytest.raises(RuntimeError) as info:
+    with pytest.raises(httpx.HTTPStatusError, match="500 Internal Server Error"):
         await tools.register_workflow(str(cwl_file), "t")
     (workflow_id,) = fake.workflows
-    msg = str(info.value)
-    assert msg.startswith("Failed while deploying to Omics: 502")
-    assert f"created version 1 of workflow {workflow_id}" in msg
-    assert f"create_workflow_deployment(workflow_id='{workflow_id}', version_num=1" in msg
+    assert len(fake.files) == 1
+    assert fake.versions[workflow_id] == [], "no version was created"
+
+
+async def test_deploy_fails_but_the_version_can_still_be_deployed(
+        tools, fake, fake_cwltool, cwl_file):
+    fake.fail("POST", "/workflows/[^/]+/versions/\\d+/deployments", 502)
+    with pytest.raises(httpx.HTTPStatusError, match="502 Bad Gateway"):
+        await tools.register_workflow(str(cwl_file), "t")
+    (workflow_id,) = fake.workflows
+    assert len(fake.versions[workflow_id]) == 1, "the version survives"
+    assert fake.deployments == []
 
     fake._faults.clear()                        # the cause is fixed
     await tools.create_workflow_deployment(workflow_id, 1, OMICS_ENGINE)
     assert len(fake.deployments) == 1
-    assert len(fake.versions[workflow_id]) == 1, "recovery must not duplicate the version"
+    assert len(fake.versions[workflow_id]) == 1, "deploying must not add a version"
 
 
-async def test_update_version_fails_after_upload(tools, fake, fake_cwltool, cwl_file):
+async def test_update_version_create_fails_after_upload(
+        tools, fake, fake_cwltool, cwl_file):
     workflow_id = fake.add_workflow()
+    before = len(fake.versions[workflow_id])
     fake.fail("POST", "/workflows/[^/]+/versions", 500)
-    with pytest.raises(RuntimeError) as info:
+    with pytest.raises(httpx.HTTPStatusError, match="500 Internal Server Error"):
         await tools.update_workflow(str(cwl_file), workflow_id)
-    (file_id,) = fake.files
-    msg = str(info.value)
-    assert "uploaded the packed CWL" in msg
-    assert "created workflow" not in msg, "the workflow already existed"
-    assert (f"update_workflow_from_file_id(file_id='{file_id}', "
-            f"workflow_id='{workflow_id}')") in msg
+    assert len(fake.files) == 1, "the uploaded file is not cleaned up"
+    assert len(fake.versions[workflow_id]) == before
 
 
 # --- the real cwltool ----------------------------------------------------------------

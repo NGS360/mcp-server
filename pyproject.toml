@@ -15,6 +15,10 @@ dependencies = [
     # Imported directly by server.main to serve the streamable-HTTP ASGI app.
     # mcp already pulls it in, but declare it since we import it ourselves.
     "uvicorn>=0.31.1",
+    # Same reasoning: tools.workflows imports TypedDict/NotRequired from it
+    # rather than from typing, because pydantic rejects typing.TypedDict on
+    # Python < 3.12 and requires-python allows 3.11.
+    "typing-extensions>=4.12",
 ]
 
 [project.scripts]
