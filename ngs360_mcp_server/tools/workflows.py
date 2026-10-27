@@ -3,10 +3,15 @@
 import os
 import shutil
 import subprocess
+import textwrap
 from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+
+# typing_extensions rather than typing: pydantic rejects
+# typing.TypedDict on Python < 3.12, and this package supports 3.11.
+from typing_extensions import NotRequired, TypedDict
 
 from ngs360_mcp_server.client import NGS360Client
 
@@ -73,8 +78,10 @@ def _pack_cwl(src: str) -> bytes:
             "cwltool is not on PATH — install it (pip install cwltool) "
             "before calling register_workflow / update_workflow."
         )
+    # --disable-color: the stderr ends up in an error message for the
+    # model, where ANSI colour codes are just noise.
     proc = subprocess.run(
-        ["cwltool", "--quiet", "--pack", src],
+        ["cwltool", "--quiet", "--disable-color", "--pack", src],
         capture_output=True,
         check=False,
     )
@@ -163,6 +170,142 @@ async def _upload_packed_cwl(
     return str(resp["id"])
 
 
+# ----------------------------------------------------------------------
+# Input/output schema
+#
+# The API's WorkflowVersion has nullable inputs/outputs JSON columns. The
+# server does not read CWL: the calling model reads the workflow's CWL and
+# passes the parameters in, following _IO_SCHEMA_GUIDE. The shape is
+# checked by the argument schema below and again by the API; the values
+# are the model's responsibility.
+# ----------------------------------------------------------------------
+
+
+class WorkflowInput(TypedDict):
+    """One workflow input, as the API's WorkflowInput model stores it."""
+
+    id: str
+    type: str
+    required: bool
+    doc: NotRequired[str]
+    default: NotRequired[Any]
+
+
+class WorkflowOutput(TypedDict):
+    """One workflow output, as the API's WorkflowOutput model stores it."""
+
+    id: str
+    type: str
+    doc: NotRequired[str]
+
+
+_IO_SCHEMA_GUIDE = """\
+Recording the workflow's inputs and outputs
+-------------------------------------------
+``inputs`` and ``outputs`` record the workflow's parameters on the new
+version, so later callers can see what it needs without reading the CWL.
+Fill them in yourself by reading the workflow's main CWL file -- the file
+being registered, not the tools its steps run -- and copying its
+top-level ``inputs:`` and ``outputs:`` sections. Include every parameter,
+in the order the file lists them. Do not guess, and do not ask the user
+to type them out.
+
+If you cannot read the CWL, leave both arguments out. The version is
+still created and its schema is recorded as null ("not recorded"). Do
+not pass ``[]`` for that: an empty list means "this workflow declares no
+parameters", and is right only when the CWL really has none.
+
+Input entry:   {"id", "type", "required", "doc"?, "default"?}
+Output entry:  {"id", "type", "doc"?}
+
+id
+    The parameter's name as written, e.g. ``sample_id``. In packed CWL
+    (``cwltool --pack`` output) ids look like ``#main/sample_id``; drop
+    everything up to the last ``/``.
+type
+    CWL type shorthand, as a string:
+      File  Directory  string  int  long  float  double  boolean  Any
+      T?           optional; also written ["null", T]
+      T[]          array; also written {type: array, items: T}
+      T[]?         optional array      T?[]   array of optional items
+      (A|B)        a union of several types, e.g. (float|string)[]?
+      enum(A|B)    an enum, listing its symbols
+      record(a,b)  a record, listing its field names
+    For a type defined under SchemaDefRequirement, write out what it
+    defines (e.g. ``enum(WES|WGS)``), not its name.
+required  (inputs only)
+    false if the type is optional (``?`` / includes "null") OR the input
+    has a ``default``; true otherwise.
+doc
+    The parameter's ``doc``. If it has none, its ``label``. If neither,
+    leave the key out. A ``doc`` written as a list of paragraphs is
+    joined with newlines.
+default  (inputs only)
+    The ``default`` value exactly as written, as JSON; leave the key out
+    if there is none. JSON has no infinity or NaN, so for a default of
+    ``.inf`` / ``.nan`` leave ``default`` out (``required`` stays false).
+
+Both list form (``- id: reads``) and map form (``reads: {type: ...}``,
+or just ``reads: File[]``) are valid CWL; treat them the same. Ignore
+everything else on a parameter (inputBinding, secondaryFiles, format,
+outputSource, sbg:* hints ...).
+
+Example -- this CWL:
+
+    inputs:
+      reads:
+        type: File[]
+        doc: Input reads, one file per lane
+      min_quality:
+        type: int
+        default: 20
+        label: Minimum base quality
+      reference: File?
+    outputs:
+      report:
+        type: File
+        doc: QC report
+
+is recorded as:
+
+    inputs=[
+      {"id": "reads", "type": "File[]", "required": true,
+       "doc": "Input reads, one file per lane"},
+      {"id": "min_quality", "type": "int", "required": false,
+       "doc": "Minimum base quality", "default": 20},
+      {"id": "reference", "type": "File?", "required": false},
+    ]
+    outputs=[{"id": "report", "type": "File", "doc": "QC report"}]
+
+Tell the user how many inputs and outputs you recorded, so they can
+spot a parameter that was missed."""
+
+
+def _documents_io_schema(fn):
+    """Append _IO_SCHEMA_GUIDE to a tool's docstring.
+
+    One copy, so the tools accepting inputs/outputs can't drift apart,
+    while each tool's description still carries the whole guide: a model
+    choosing a tool reads only that tool's description. FastMCP uses the
+    docstring verbatim, so the guide is indented to match.
+    """
+    fn.__doc__ = (
+        f"{fn.__doc__.rstrip()}\n\n"
+        f"{textwrap.indent(_IO_SCHEMA_GUIDE, ' ' * 8)}\n        "
+    )
+    return fn
+
+
+def _io_counts(
+    inputs: list | None, outputs: list | None,
+) -> dict[str, int | None]:
+    """The ``inputs_recorded`` / ``outputs_recorded`` result fields."""
+    return {
+        "inputs_recorded": len(inputs) if inputs is not None else None,
+        "outputs_recorded": len(outputs) if outputs is not None else None,
+    }
+
+
 async def _check_workflow_exists(
     client: NGS360Client, workflow_id: str,
 ) -> None:
@@ -201,6 +344,8 @@ async def _create_version_and_deploy(
     workflow_id: str,
     file_id: str,
     attributes: list[dict[str, str]],
+    inputs: list[dict] | None = None,
+    outputs: list[dict] | None = None,
 ) -> tuple[int, str]:
     """Create a new WorkflowVersion pointing at ``file_id`` and deploy it
     to Omics via the auto-register path. Returns (version_num, arn).
@@ -208,10 +353,20 @@ async def _create_version_and_deploy(
     Extracted so register_workflow and update_workflow share the tail
     end of the chain — the only thing that differs between them is
     whether a Workflow row already exists.
+
+    ``inputs``/``outputs`` are the CWL parameter schema, as supplied by
+    the caller (see _IO_SCHEMA_GUIDE). Empty lists are sent as-is rather than
+    dropped: a workflow genuinely declaring no outputs is a fact worth
+    recording, and distinguishable from "never captured" (null) only if
+    the empty list survives.
     """
     version_body: dict[str, Any] = {"definition_uri": f"ngs360://{file_id}"}
     if attributes:
         version_body["attributes"] = attributes
+    if inputs is not None:
+        version_body["inputs"] = inputs
+    if outputs is not None:
+        version_body["outputs"] = outputs
     version_resp = await client.post(
         f"/workflows/{workflow_id}/versions", json=version_body,
     )
@@ -285,8 +440,12 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         return await client.post("/workflows", json=body)
 
     @mcp.tool()
+    @_documents_io_schema
     async def create_workflow_version(
-        workflow_id: str, definition_uri: str
+        workflow_id: str,
+        definition_uri: str,
+        inputs: list[WorkflowInput] | None = None,
+        outputs: list[WorkflowOutput] | None = None,
     ) -> dict:
         """Create a new version for a workflow (row only, no deploy).
 
@@ -302,11 +461,20 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
 
         Args:
             workflow_id: The workflow UUID
-            definition_uri: URI to the workflow definition file
+            definition_uri: URI to the workflow definition file —
+                ``ngs360://<file_id>`` or ``s3://...``
+            inputs: The workflow's input parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
+            outputs: The workflow's output parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
         """
+        body: dict[str, Any] = {"definition_uri": definition_uri}
+        if inputs is not None:
+            body["inputs"] = inputs
+        if outputs is not None:
+            body["outputs"] = outputs
         return await client.post(
-            f"/workflows/{workflow_id}/versions",
-            json={"definition_uri": definition_uri},
+            f"/workflows/{workflow_id}/versions", json=body,
         )
 
     @mcp.tool()
@@ -323,6 +491,12 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         workflow_id: str, version_num: int
     ) -> dict:
         """Get a specific workflow version.
+
+        The response carries the version's recorded ``inputs`` /
+        ``outputs`` parameter schema, or null for either when it was not
+        recorded. Read ``inputs`` before launching the workflow to tell
+        the user which parameters it needs and what each one is for —
+        see wes_run_workflow.
 
         Args:
             workflow_id: The workflow UUID
@@ -506,9 +680,12 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @_documents_io_schema
     async def register_workflow(
         cwl_path: str,
         name: str,
+        inputs: list[WorkflowInput] | None = None,
+        outputs: list[WorkflowOutput] | None = None,
     ) -> dict:
         """Register a NEW workflow on NGS360, end-to-end.
 
@@ -538,12 +715,18 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
                 author's canonical name (e.g. "WES alignment
                 (Translational)"). Fall back to the filename without
                 ``.cwl`` if the CWL has no label.
+            inputs: The workflow's input parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
+            outputs: The workflow's output parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
 
         Returns:
             workflow_id: NGS360 Workflow UUID
             version_num: WorkflowVersion number (always 1 for a new workflow)
             file_id: NGS360 File UUID of the packed CWL
             omics_arn: Full Omics workflow ARN
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if inputs / outputs were not given
 
         Under remote MCP transport (streamable-http) this tool cannot
         work — cwl_path resolves on the server host, not the caller's
@@ -566,19 +749,23 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         workflow_id = str(wf_resp["id"])
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
         return {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            **_io_counts(inputs, outputs),
         }
 
     @mcp.tool()
+    @_documents_io_schema
     async def update_workflow(
         cwl_path: str,
         workflow_id: str,
+        inputs: list[WorkflowInput] | None = None,
+        outputs: list[WorkflowOutput] | None = None,
     ) -> dict:
         """Add a new version to an EXISTING workflow and deploy it.
 
@@ -590,12 +777,18 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         Args:
             cwl_path: Local path to the source .cwl file.
             workflow_id: NGS360 Workflow UUID to add a new version under.
+            inputs: The workflow's input parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
+            outputs: The workflow's output parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
 
         Returns:
             workflow_id: echo of the argument
             version_num: new WorkflowVersion number (server auto-increments)
             file_id: NGS360 File UUID of the packed CWL
             omics_arn: Full Omics workflow ARN for this new version
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if inputs / outputs were not given
 
         Under remote MCP transport (streamable-http) this tool cannot
         work — cwl_path resolves on the server host, not the caller's
@@ -620,13 +813,14 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         file_id = await _upload_packed_cwl(client, packed, upload_name)
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
         return {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            **_io_counts(inputs, outputs),
         }
 
     # ------------------------------------------------------------------
@@ -635,12 +829,15 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @_documents_io_schema
     async def register_workflow_from_file_id(
         file_id: str,
         name: str,
         git_commit: str | None = None,
         git_repo: str | None = None,
         git_ref: str | None = None,
+        inputs: list[WorkflowInput] | None = None,
+        outputs: list[WorkflowOutput] | None = None,
     ) -> dict:
         """Register a NEW workflow when the caller already has a packed
         CWL uploaded to NGS360 (i.e. has a ``file_id`` in hand). Use
@@ -686,7 +883,8 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
                  git remote get-url origin             # → git_repo
                  git rev-parse --abbrev-ref HEAD       # → git_ref
 
-          6. Call this tool with the file_id and (optional) git values.
+          6. Call this tool with the file_id, the inputs/outputs read
+             from the CWL (see below), and the optional git values.
 
         Args:
             file_id: NGS360 File UUID of the already-uploaded packed CWL.
@@ -700,12 +898,18 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
                 origin`` output). Skipped if not provided.
             git_ref: Optional branch/tag name from the CWL's source
                 repo (e.g. ``main``). Skipped if not provided.
+            inputs: The workflow's input parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
+            outputs: The workflow's output parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
 
         Returns:
             workflow_id: NGS360 Workflow UUID
             version_num: WorkflowVersion number (always 1 for a new workflow)
             file_id: echo of the argument
             omics_arn: Full Omics workflow ARN
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if inputs / outputs were not given
         """
         attributes = _git_attributes_from_args(git_commit, git_repo, git_ref)
 
@@ -713,22 +917,26 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
         workflow_id = str(wf_resp["id"])
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
         return {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            **_io_counts(inputs, outputs),
         }
 
     @mcp.tool()
+    @_documents_io_schema
     async def update_workflow_from_file_id(
         file_id: str,
         workflow_id: str,
         git_commit: str | None = None,
         git_repo: str | None = None,
         git_ref: str | None = None,
+        inputs: list[WorkflowInput] | None = None,
+        outputs: list[WorkflowOutput] | None = None,
     ) -> dict:
         """Add a new version to an EXISTING workflow when the caller
         already has the packed CWL uploaded to NGS360. Remote-MCP
@@ -749,22 +957,29 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
             git_commit: Optional. See register_workflow_from_file_id docs.
             git_repo: Optional. See register_workflow_from_file_id docs.
             git_ref: Optional. See register_workflow_from_file_id docs.
+            inputs: The workflow's input parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
+            outputs: The workflow's output parameters, read from its CWL
+                (see below). Omit if the CWL can't be read.
 
         Returns:
             workflow_id: echo of the argument
             version_num: new WorkflowVersion number
             file_id: echo of the argument
             omics_arn: Full Omics workflow ARN for this new version
+            inputs_recorded / outputs_recorded: how many parameters were
+                recorded, or null if inputs / outputs were not given
         """
         await _check_workflow_exists(client, workflow_id)
         attributes = _git_attributes_from_args(git_commit, git_repo, git_ref)
 
         version_num, omics_arn = await _create_version_and_deploy(
-            client, workflow_id, file_id, attributes,
+            client, workflow_id, file_id, attributes, inputs, outputs,
         )
         return {
             "workflow_id": workflow_id,
             "version_num": version_num,
             "file_id": file_id,
             "omics_arn": omics_arn,
+            **_io_counts(inputs, outputs),
         }

@@ -66,6 +66,37 @@ def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
         COMPLETE — do not report a run as "submitted successfully" based
         on this call alone.
 
+        Helping the user assemble workflow_params
+        -----------------------------------------
+        NGS360 workflow versions can carry the workflow's parameter
+        schema, recorded when the version was registered. Use it to help
+        the user, before submitting:
+
+          1. Split ``workflow_url`` on ":" to get the workflow id and the
+             version or alias. For an alias, resolve it to a version
+             number with list_workflow_aliases.
+          2. Call get_workflow_version(workflow_id, version_num) and read
+             its ``inputs``.
+
+        With ``inputs`` in hand, list the parameters for the user — id,
+        type, and the ``doc`` explaining what each one is — saying which
+        are required and which you still need values for. Never invent a
+        parameter name or a File path.
+
+        Compare what the user gives you against that list and point out
+        anything that disagrees: a missing required input, a name not in
+        the schema, a value whose type looks wrong. Then **submit anyway
+        if the user wants to.** This is a reminder, not a gate: the
+        recorded schema is supplied by whoever registered the version, so
+        it can be wrong or out of date, and testing an unusual
+        combination is legitimate. Report the mismatch and let the user
+        decide.
+
+        ``inputs`` is null whenever the schema was not recorded — the
+        column is optional, and versions registered before it existed
+        have nothing. Then simply proceed. Do not claim the parameters
+        were checked, and do not block the run for lack of a schema.
+
         Args:
             workflow_url: Workflow reference. NGS360 workflows use
                 "<workflow_id_no_dashes>:<version_or_alias>".
@@ -75,7 +106,8 @@ def register_wes_tools(mcp: FastMCP, wes_client: NGS360Client) -> None:
             workflow_params: Input parameters for the workflow. File
                 inputs can be S3 URIs, or "ngs360://<file_id>" — the
                 server resolves ngs360:// references to their backing
-                S3 URIs before dispatching to Omics.
+                S3 URIs before dispatching to Omics. See "Helping the
+                user assemble workflow_params" above.
             workflow_engine: Usually omit; inferred from the deployment.
             workflow_engine_version: Usually omit.
             workflow_engine_parameters: AWS Omics run options. No
