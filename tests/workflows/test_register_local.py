@@ -1,17 +1,21 @@
 """register_workflow / update_workflow: pack a local CWL, upload, create,
-deploy. Most tests need cwltool on PATH and are skipped without it."""
+deploy.
+
+cwltool is faked (see conftest), because the server never reads the CWL —
+it passes the path to ``cwltool --pack`` and uploads what that prints. The
+one test that runs the real thing is marked ``requires_cwltool``.
+"""
 
 import json
 import re
-import shutil
 
 import httpx
 import pytest
 
 from .conftest import (
-    CWL,
     GOOD_TOOL_INPUTS,
     GOOD_TOOL_OUTPUTS,
+    PACKED_STDOUT,
     requires_cwltool,
     stored,
 )
@@ -19,15 +23,12 @@ from .fake_ngs360 import OMICS_ENGINE
 
 pytestmark = pytest.mark.anyio
 
-ANSI_ESCAPE = re.compile(r"\x1b\[")
-
 
 # --- success -------------------------------------------------------------------
 
-@requires_cwltool
-async def test_register_new_workflow_end_to_end(tools, fake, git_repo):
+async def test_register_new_workflow_end_to_end(tools, fake, fake_cwltool, git_repo, cwl_file):
     result = await tools.register_workflow(
-        str(git_repo / "good_tool.cwl"), "Good tool",
+        str(git_repo / cwl_file.name), "Good tool",
         inputs=GOOD_TOOL_INPUTS, outputs=GOOD_TOOL_OUTPUTS)
 
     workflow_id = result["workflow_id"]
@@ -54,47 +55,53 @@ async def test_register_new_workflow_end_to_end(tools, fake, git_repo):
     assert fake.deployments[0]["engine"] == OMICS_ENGINE
 
 
-@requires_cwltool
-async def test_upload_form_and_packed_content(tools, fake, git_repo):
-    result = await tools.register_workflow(str(git_repo / "good_tool.cwl"), "Good tool")
-    record = fake.files[result["file_id"]]
-    assert re.fullmatch(r"good_tool\.\d{8}T\d{6}Z\.cwl", record["form"]["filename"])
-    assert record["form"]["relative_path"] == "workflow_definition_file"
-    assert record["form"]["project_id"] == "P-00000000-0001"
-    uploaded = json.loads(fake.uploads[result["file_id"]])
-    assert uploaded["id"] == "#main", "the packed CWL is what gets uploaded"
+async def test_cwltool_is_invoked_on_the_given_path(tools, fake, fake_cwltool, cwl_file):
+    await tools.register_workflow(str(cwl_file), "t")
+    assert fake_cwltool.args == ["--quiet", "--disable-color", "--pack", str(cwl_file)]
 
 
-@requires_cwltool
-async def test_git_provenance_from_a_clean_checkout(tools, fake, git_repo):
-    await tools.register_workflow(str(git_repo / "good_tool.cwl"), "t")
+async def test_cwltool_stdout_is_what_gets_uploaded(tools, fake, fake_cwltool, cwl_file):
+    # Not the source file: the packed output is what NGS360 stores.
+    result = await tools.register_workflow(str(cwl_file), "t")
+    assert fake.uploads[result["file_id"]] == PACKED_STDOUT
+    assert cwl_file.read_bytes() != PACKED_STDOUT
+
+
+async def test_upload_form_fields(tools, fake, fake_cwltool, cwl_file):
+    result = await tools.register_workflow(str(cwl_file), "t")
+    form = fake.files[result["file_id"]]["form"]
+    assert re.fullmatch(r"example_tool\.\d{8}T\d{6}Z\.cwl", form["filename"])
+    assert form["relative_path"] == "workflow_definition_file"
+    assert form["project_id"] == "P-00000000-0001"
+
+
+async def test_git_provenance_from_a_clean_checkout(
+        tools, fake, fake_cwltool, git_repo, cwl_file):
+    await tools.register_workflow(str(git_repo / cwl_file.name), "t")
     attrs = {a["key"]: a["value"] for a in fake.latest_version()["attributes"]}
     assert re.fullmatch(r"[0-9a-f]{40}", attrs["git_commit"])
     assert attrs["git_repo"] == "https://example.com/org/workflows.git"
     assert attrs["git_ref"] == "main"
 
 
-@requires_cwltool
-async def test_git_provenance_marks_a_dirty_tree(tools, fake, git_repo):
-    cwl = git_repo / "good_tool.cwl"
-    cwl.write_text(cwl.read_text() + "\n# local edit\n")
-    await tools.register_workflow(str(cwl), "t")
+async def test_git_provenance_marks_a_dirty_tree(
+        tools, fake, fake_cwltool, git_repo, cwl_file):
+    tracked = git_repo / cwl_file.name
+    tracked.write_text(tracked.read_text() + "\n# local edit\n")
+    await tools.register_workflow(str(tracked), "t")
     attrs = {a["key"]: a["value"] for a in fake.latest_version()["attributes"]}
     assert attrs["git_commit"].endswith("+dirty")
 
 
-@requires_cwltool
-async def test_no_git_attributes_outside_a_checkout(tools, fake, tmp_path):
-    shutil.copy(CWL / "good_tool.cwl", tmp_path / "good_tool.cwl")
-    await tools.register_workflow(str(tmp_path / "good_tool.cwl"), "t")
+async def test_no_git_attributes_outside_a_checkout(tools, fake, fake_cwltool, cwl_file):
+    await tools.register_workflow(str(cwl_file), "t")
     assert fake.latest_version()["attributes"] is None
 
 
-@requires_cwltool
-async def test_update_adds_a_version(tools, fake, git_repo):
+async def test_update_adds_a_version(tools, fake, fake_cwltool, git_repo, cwl_file):
     workflow_id = fake.add_workflow(versions=2)
     result = await tools.update_workflow(
-        str(git_repo / "good_tool.cwl"), workflow_id,
+        str(git_repo / cwl_file.name), workflow_id,
         inputs=GOOD_TOOL_INPUTS, outputs=GOOD_TOOL_OUTPUTS)
     assert result["version_num"] == 3
     assert result["inputs_recorded"] == 4
@@ -105,19 +112,16 @@ async def test_update_adds_a_version(tools, fake, git_repo):
 
 # --- the schema is recorded as given ---------------------------------------------
 
-@requires_cwltool
-async def test_no_schema_given_leaves_it_null(tools, fake):
-    result = await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+async def test_no_schema_given_leaves_it_null(tools, fake, fake_cwltool, cwl_file):
+    result = await tools.register_workflow(str(cwl_file), "t")
     assert result["inputs_recorded"] is None and result["outputs_recorded"] is None
     version = fake.latest_version(result["workflow_id"])
     assert version["inputs"] is None and version["outputs"] is None
     assert len(fake.deployments) == 1
 
 
-@requires_cwltool
-async def test_empty_lists_are_recorded_as_empty(tools, fake):
-    result = await tools.register_workflow(str(CWL / "good_tool.cwl"), "t",
-                                           inputs=[], outputs=[])
+async def test_empty_lists_are_recorded_as_empty(tools, fake, fake_cwltool, cwl_file):
+    result = await tools.register_workflow(str(cwl_file), "t", inputs=[], outputs=[])
     assert (result["inputs_recorded"], result["outputs_recorded"]) == (0, 0)
     version = fake.latest_version(result["workflow_id"])
     assert version["inputs"] == [] and version["outputs"] == []
@@ -125,7 +129,7 @@ async def test_empty_lists_are_recorded_as_empty(tools, fake):
 
 # --- refused before anything is created ------------------------------------------
 
-async def test_missing_cwl_file(tools, fake):
+async def test_missing_cwl_file(tools, fake, fake_cwltool):
     with pytest.raises(ValueError, match="CWL file not found"):
         await tools.register_workflow("/does/not/exist.cwl", "t")
     with pytest.raises(ValueError, match="CWL file not found"):
@@ -137,72 +141,62 @@ async def test_missing_cwl_file(tools, fake):
     ("register_workflow", {"name": "t"}, "register_workflow_from_file_id"),
     ("update_workflow", {"workflow_id": "w1"}, "update_workflow_from_file_id"),
 ])
-async def test_refused_under_remote_transport(tools, fake, monkeypatch, tool, args, sibling):
+async def test_refused_under_remote_transport(
+        tools, fake, monkeypatch, cwl_file, tool, args, sibling):
     monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
     with pytest.raises(RuntimeError, match=f"Use {sibling} instead"):
-        await getattr(tools, tool)(cwl_path=str(CWL / "good_tool.cwl"), **args)
+        await getattr(tools, tool)(cwl_path=str(cwl_file), **args)
     assert fake.requests == []
 
 
-@requires_cwltool
-@pytest.mark.parametrize("fixture", [
-    "fail_pack_yaml_indent.cwl",
-    "fail_pack_unknown_type.cwl",
-    "fail_pack_missing_run.cwl",
-    "fail_pack_duplicate_ids.cwl",
-])
-async def test_cwl_that_will_not_pack(tools, fake, fixture):
+async def test_cwl_that_will_not_pack(tools, fake, fake_cwltool, cwl_file):
+    fake_cwltool.fail()
     with pytest.raises(RuntimeError, match="cwltool --pack .* failed") as info:
-        await tools.register_workflow(str(CWL / fixture), "t")
-    assert not ANSI_ESCAPE.search(str(info.value)), "colour codes leaked into the error"
+        await tools.register_workflow(str(cwl_file), "t")
+    assert fake_cwltool.stderr in str(info.value), "cwltool's reason must be relayed"
     assert fake.requests == []
 
 
-async def test_cwltool_not_installed(tools, fake, monkeypatch, tmp_path):
-    monkeypatch.setenv("PATH", str(tmp_path))
+async def test_cwltool_not_installed(tools, fake, monkeypatch, tmp_path, cwl_file):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     with pytest.raises(RuntimeError, match="cwltool is not on PATH"):
-        await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+        await tools.register_workflow(str(cwl_file), "t")
     assert fake.requests == []
 
 
-@requires_cwltool
-async def test_update_unknown_workflow_uploads_nothing(tools, fake):
+async def test_update_unknown_workflow_uploads_nothing(tools, fake, fake_cwltool, cwl_file):
     with pytest.raises(httpx.HTTPStatusError, match="404 .*: Workflow not found"):
-        await tools.update_workflow(str(CWL / "good_tool.cwl"), "nope")
+        await tools.update_workflow(str(cwl_file), "nope")
     assert fake.writes() == [] and fake.files == {}
 
 
-@requires_cwltool
-async def test_expired_token(tools_with_token, fake):
+async def test_expired_token(tools_with_token, fake, fake_cwltool, cwl_file):
     tools = tools_with_token("expired")
     with pytest.raises(httpx.HTTPStatusError, match="401 .*Could not validate credentials"):
-        await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+        await tools.register_workflow(str(cwl_file), "t")
     assert fake.files == {} and fake.workflows == {}
 
 
-@requires_cwltool
-async def test_upload_fails(tools, fake):
+async def test_upload_fails(tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/files/upload", 500)
     with pytest.raises(httpx.HTTPStatusError, match="500 .*injected 500"):
-        await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+        await tools.register_workflow(str(cwl_file), "t")
     assert fake.workflows == {}
 
 
-@requires_cwltool
-async def test_upload_response_without_id(tools, fake):
+async def test_upload_response_without_id(tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/files/upload", 201, {"ok": True})
     with pytest.raises(RuntimeError, match="missing 'id'"):
-        await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+        await tools.register_workflow(str(cwl_file), "t")
     assert fake.workflows == {}
 
 
 # --- failures part-way through: say what exists and how to finish ---------------------
 
-@requires_cwltool
-async def test_workflow_create_fails_after_upload(tools, fake):
+async def test_workflow_create_fails_after_upload(tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/workflows", 500)
     with pytest.raises(RuntimeError) as info:
-        await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+        await tools.register_workflow(str(cwl_file), "t")
     (file_id,) = fake.files
     msg = str(info.value)
     assert msg.startswith("Failed while creating the workflow: 500")
@@ -210,11 +204,10 @@ async def test_workflow_create_fails_after_upload(tools, fake):
     assert f"register_workflow_from_file_id(file_id='{file_id}', name=...)" in msg
 
 
-@requires_cwltool
-async def test_version_create_fails_after_workflow(tools, fake):
+async def test_version_create_fails_after_workflow(tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/workflows/[^/]+/versions", 500)
     with pytest.raises(RuntimeError) as info:
-        await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+        await tools.register_workflow(str(cwl_file), "t")
     (file_id,), (workflow_id,) = fake.files, fake.workflows
     msg = str(info.value)
     assert msg.startswith("Failed while creating the version")
@@ -223,11 +216,11 @@ async def test_version_create_fails_after_workflow(tools, fake):
             f"workflow_id='{workflow_id}')") in msg
 
 
-@requires_cwltool
-async def test_deploy_fails_and_the_suggested_recovery_works(tools, fake):
+async def test_deploy_fails_and_the_suggested_recovery_works(
+        tools, fake, fake_cwltool, cwl_file):
     fake.fail("POST", "/workflows/[^/]+/versions/\\d+/deployments", 502)
     with pytest.raises(RuntimeError) as info:
-        await tools.register_workflow(str(CWL / "good_tool.cwl"), "t")
+        await tools.register_workflow(str(cwl_file), "t")
     (workflow_id,) = fake.workflows
     msg = str(info.value)
     assert msg.startswith("Failed while deploying to Omics: 502")
@@ -240,15 +233,74 @@ async def test_deploy_fails_and_the_suggested_recovery_works(tools, fake):
     assert len(fake.versions[workflow_id]) == 1, "recovery must not duplicate the version"
 
 
-@requires_cwltool
-async def test_update_version_fails_after_upload(tools, fake):
+async def test_update_version_fails_after_upload(tools, fake, fake_cwltool, cwl_file):
     workflow_id = fake.add_workflow()
     fake.fail("POST", "/workflows/[^/]+/versions", 500)
     with pytest.raises(RuntimeError) as info:
-        await tools.update_workflow(str(CWL / "good_tool.cwl"), workflow_id)
+        await tools.update_workflow(str(cwl_file), workflow_id)
     (file_id,) = fake.files
     msg = str(info.value)
     assert "uploaded the packed CWL" in msg
     assert "created workflow" not in msg, "the workflow already existed"
     assert (f"update_workflow_from_file_id(file_id='{file_id}', "
             f"workflow_id='{workflow_id}')") in msg
+
+
+# --- the real cwltool ----------------------------------------------------------------
+
+@requires_cwltool
+def test_real_cwltool_accepts_the_flags_we_pass(tmp_path):
+    """Smoke test for the one thing the fake cannot check.
+
+    Every other test here fakes cwltool, so a flag it no longer accepts, or
+    output that stopped being JSON, would go unnoticed. This packs a minimal
+    CWL with the real tool and the real arguments.
+    """
+    from ngs360_mcp_server.tools.workflows import _pack_cwl
+
+    source = tmp_path / "minimal.cwl"
+    source.write_text(
+        "cwlVersion: v1.2\n"
+        "class: CommandLineTool\n"
+        "baseCommand: [echo]\n"
+        "inputs:\n"
+        "  message:\n"
+        "    type: string\n"
+        "    inputBinding: {position: 1}\n"
+        "outputs: []\n"
+    )
+    packed = json.loads(_pack_cwl(str(source)))
+    assert packed["id"] == "#main"
+    assert [p["id"] for p in packed["inputs"]] == ["#main/message"]
+
+
+@requires_cwltool
+def test_real_cwltool_failure_is_relayed_without_colour_codes(tmp_path):
+    source = tmp_path / "broken.cwl"
+    source.write_text(
+        "cwlVersion: v1.2\n"
+        "class: CommandLineTool\n"
+        "baseCommand: [echo]\n"
+        "inputs:\n"
+        "  message:\n"
+        "    type: string\n"
+        "   label: wrong indentation\n"
+        "outputs: []\n"
+    )
+    from ngs360_mcp_server.tools.workflows import _pack_cwl
+
+    with pytest.raises(RuntimeError, match="cwltool --pack .* failed") as info:
+        _pack_cwl(str(source))
+    # --disable-color is why this holds; without it cwltool emits ANSI codes.
+    assert "\x1b[" not in str(info.value)
+    assert "message" in str(info.value) or "validation" in str(info.value).lower()
+
+
+async def test_path_with_shell_metacharacters_is_one_argument(
+        tools, fake, fake_cwltool, tmp_path):
+    """_pack_cwl runs cwltool without a shell, so a path is never split."""
+    odd = tmp_path / "a b; echo pwned .cwl"
+    odd.write_text("x\n")
+    await tools.register_workflow(str(odd), "t")
+    assert fake_cwltool.args[-1:] != [";"], "the path was shell-interpreted"
+    assert str(odd) in " ".join(fake_cwltool.args)
