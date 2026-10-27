@@ -105,3 +105,36 @@ async def test_wrong_argument_type(mcp_call, fake):
     result = await mcp_call("register_workflow_from_file_id", {"file_id": 123, "name": "wf"})
     assert result.isError and "file_id" in result.content[0].text
     assert fake.requests == []
+
+
+# --- pointing the model at the recorded schema when launching -----------------
+
+async def test_get_workflow_version_advertises_the_schema(mcp_server):
+    """A model only looks up the schema if told the response carries it."""
+    described = {t.name: t for t in await mcp_server.list_tools()}["get_workflow_version"]
+    assert "inputs" in described.description
+    assert "wes_run_workflow" in described.description
+
+
+async def test_wes_run_workflow_guides_assembling_params():
+    """The launch tool has to point at get_workflow_version itself: it is
+    where a model starts when asked to run a workflow."""
+    from mcp.server.fastmcp import FastMCP
+
+    from ngs360_mcp_server.client import NGS360Client
+    from ngs360_mcp_server.tools.wes import register_wes_tools
+
+    server = FastMCP("ngs360-test")
+    register_wes_tools(server, NGS360Client(base_url="https://api.test",
+                                            path_prefix="/ga4gh/wes/v1"))
+    described = {t.name: t for t in await server.list_tools()}["wes_run_workflow"]
+    text = described.description
+
+    # The workflow_params entry cross-references this heading by name.
+    assert "Helping the user assemble workflow_params" in text
+    assert "get_workflow_version" in text, "does not say where the schema lives"
+    assert "list_workflow_aliases" in text, "no way to resolve an alias to a version"
+    # Guidance, not a gate: a mismatch is reported, the run still goes ahead.
+    assert "submit anyway" in text
+    # And a version with no recorded schema must not be treated as an error.
+    assert "null" in text and "not recorded" in text

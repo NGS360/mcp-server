@@ -492,6 +492,12 @@ def register_workflows_tools(mcp: FastMCP, client: NGS360Client) -> None:
     ) -> dict:
         """Get a specific workflow version.
 
+        The response carries the version's recorded ``inputs`` /
+        ``outputs`` parameter schema, or null for either when it was not
+        recorded. Read ``inputs`` before launching the workflow to tell
+        the user which parameters it needs and what each one is for —
+        see wes_run_workflow.
+
         Args:
             workflow_id: The workflow UUID
             version_num: The version number (integer 1, 2, 3, ...), not
