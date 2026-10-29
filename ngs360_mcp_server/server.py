@@ -44,7 +44,11 @@ def create_server() -> FastMCP:
             "files, batch jobs, workflows, pipelines, QC metrics, vendors, "
             "settings, and platforms. Also provides GA4GH Workflow Execution "
             "Service (WES) tools for submitting and monitoring workflow runs. "
-            "WES tools are prefixed with wes_."
+            "WES tools are prefixed with wes_. "
+            "Every call runs as the calling user, and NGS360 decides what that "
+            "user may do. A tool error starting 'Permission denied' or 'Not "
+            "authenticated' is final: do not retry the call or work around it "
+            "with another tool; tell the user what was refused."
         ),
         host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
         port=int(os.environ.get("FASTMCP_PORT", "8000")),

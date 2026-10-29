@@ -44,6 +44,57 @@ def _inbound_authorization() -> str | None:
     return headers.get("authorization") or None
 
 
+class NGS360AccessDenied(Exception):
+    """NGS360 refused the call: 401 (no valid credential) or 403 (not allowed).
+
+    Both are final for this caller. The API decides per user, so the same call
+    with the same credential gets the same answer, and a model left to read a
+    raw HTTPStatusError traceback will retry it or go looking for another tool
+    that does the same thing. FastMCP returns the message as the tool error, so
+    it is written for the model: what was refused, why, and to stop.
+    """
+
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        if status_code == 401:
+            message = (
+                f"Not authenticated: {detail}. Not retryable: the caller's "
+                "NGS360 credential is missing, invalid or expired. Do not retry "
+                "this or any other NGS360 tool; ask the user to sign in again "
+                "or supply a valid API key."
+            )
+        else:
+            message = (
+                f"Permission denied: {detail}. Not retryable: NGS360 will "
+                "refuse this call again for this user. Do not retry it or try "
+                "another tool to get around it. Tell the user what was refused; "
+                "they can ask the project's owner or an NGS360 administrator "
+                "for access."
+            )
+        super().__init__(message)
+
+
+def _detail(resp: httpx.Response) -> str:
+    """The API's own explanation: FastAPI's `detail`, else the body text."""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and body.get("detail"):
+        detail = body["detail"]
+        return detail if isinstance(detail, str) else str(detail)
+    text = resp.text.strip()
+    return text[:500] if text else f"HTTP {resp.status_code}"
+
+
+def _raise_for_status(resp: httpx.Response) -> None:
+    """raise_for_status, with 401 and 403 turned into NGS360AccessDenied."""
+    if resp.status_code in (401, 403):
+        raise NGS360AccessDenied(resp.status_code, _detail(resp))
+    resp.raise_for_status()
+
+
 class NGS360Client:
     """HTTP client wrapper for the NGS360 REST API."""
 
@@ -113,7 +164,7 @@ class NGS360Client:
         resp = await client.get(
             f"{self.path_prefix}{path}", params=params, headers=self._auth_headers()
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
         return resp.text
@@ -133,7 +184,7 @@ class NGS360Client:
             params=params,
             headers=self._auth_headers(),
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
         return resp.text
@@ -162,7 +213,7 @@ class NGS360Client:
             files=files,
             headers=self._auth_headers(),
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
         return resp.text
@@ -180,7 +231,7 @@ class NGS360Client:
             params=params,
             headers=self._auth_headers(),
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
         return resp.text
@@ -194,7 +245,7 @@ class NGS360Client:
         resp = await client.patch(
             f"{self.path_prefix}{path}", json=json, headers=self._auth_headers()
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
         return resp.text
@@ -206,7 +257,7 @@ class NGS360Client:
         resp = await client.delete(
             f"{self.path_prefix}{path}", params=params, headers=self._auth_headers()
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         if resp.status_code == 204:
             return None
         if resp.headers.get("content-type", "").startswith("application/json"):
