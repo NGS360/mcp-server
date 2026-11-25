@@ -243,5 +243,5 @@ def register_projects_tools(mcp: FastMCP, client: NGS360Client) -> None:
             "manifest_uri": manifest_uri,
         }
         return await client.post(
-            f"/projects/{project_id}/ingest", params=params
+            f"/projects/{project_id}/actions/ingest", params=params
         )
